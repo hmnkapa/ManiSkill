@@ -289,6 +289,41 @@ def test_skill_annotation_episode_recorder_partial_reset_replaces_selected_env()
     assert recorder.buffer["phase_id"][:, 1].tolist() == [20, 21]
 
 
+def test_skill_annotation_episode_recorder_partial_reset_only_queries_selected_env():
+    env = _ProjectingSkillAnnotationEnv()
+    recorder = SkillAnnotationEpisodeRecorder()
+
+    recorder.reset(env)
+    recorder.step(env)
+    manager = env._skill_annotation_manager
+    assert manager._previous[0].phase_id == 11
+    assert manager._previous[1].phase_id == 21
+
+    env.requested_env_indices.clear()
+    recorder.reset(env, env_idx=np.array([0]))
+
+    assert env.requested_env_indices == [(0,)]
+    assert manager._previous[0].phase_id == 12
+    assert manager._previous[1].phase_id == 21
+
+
+def test_skill_annotation_episode_recorder_partial_reset_can_initialize_buffer():
+    env = _ProjectingSkillAnnotationEnv()
+    recorder = SkillAnnotationEpisodeRecorder()
+
+    recorder.reset(env, env_idx=np.array([1]))
+
+    assert env.requested_env_indices == [(1,)]
+    assert recorder.buffer["phase_id"].shape == (1, 2)
+    assert recorder.buffer["phase_id"][0, 0] == -1
+    assert recorder.buffer["phase_id"][0, 1] == 20
+
+    recorder.step(env)
+
+    assert recorder.buffer["phase_id"].shape == (2, 2)
+    assert recorder.buffer["phase_id"][:, 1].tolist() == [20, 21]
+
+
 def test_record_episode_writes_skill_annotations_when_enabled(tmp_path):
     import h5py
 
@@ -404,13 +439,21 @@ class _ProjectingSkillAnnotationEnv:
 
     def __init__(self):
         self._call_idx = 0
+        self.requested_env_indices = []
 
     def get_skill_annotation_context(self, env_idx=None):
         if env_idx is None:
+            self.requested_env_indices.append(None)
             indices = torch.arange(self.num_envs)
         elif torch.is_tensor(env_idx):
+            self.requested_env_indices.append(
+                tuple(int(i) for i in env_idx.detach().cpu().flatten().tolist())
+            )
             indices = env_idx.flatten().long()
         else:
+            self.requested_env_indices.append(
+                tuple(int(i) for i in torch.as_tensor(env_idx).flatten().tolist())
+            )
             indices = torch.as_tensor(env_idx, dtype=torch.long).reshape(-1)
 
         call_idx = self._call_idx

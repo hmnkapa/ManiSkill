@@ -9,6 +9,7 @@ import numpy as np
 from mani_skill.utils import common
 from mani_skill.utils.skill_annotation.manager import (
     get_annotation_bundle,
+    get_annotation_bundle_for_env,
     reset_skill_annotator,
 )
 from mani_skill.utils.skill_annotation.schema import SKILL_VOCAB, SkillAnnotationBundle
@@ -38,14 +39,25 @@ class SkillAnnotationEpisodeRecorder:
         else:
             for idx in env_indices:
                 reset_skill_annotator(env, env_idx=int(idx))
-        frame = _bundle_to_frame(
-            get_annotation_bundle(
+        if env_indices is None:
+            bundle = get_annotation_bundle(
                 env,
                 cameras=self.cameras,
                 use_previous=self.use_previous,
             )
-        )
+        else:
+            bundle = get_annotation_bundle_for_env(
+                env,
+                env_idx=env_indices,
+                cameras=self.cameras,
+                use_previous=self.use_previous,
+            )
+        frame = _bundle_to_frame(bundle)
         if self.buffer is None:
+            if env_indices is not None:
+                frame = _expand_partial_frame(
+                    frame, env_indices, _get_env_num_envs(env)
+                )
             self.buffer = frame
             return
 
@@ -157,7 +169,45 @@ def _replace_last_frame(
     if env_indices is None:
         buffer[-1] = frame[-1]
     else:
-        buffer[-1, env_indices] = frame[-1, env_indices]
+        if frame.shape[1] == len(env_indices):
+            buffer[-1, env_indices] = frame[-1]
+        else:
+            buffer[-1, env_indices] = frame[-1, env_indices]
+
+
+def _expand_partial_frame(
+    frame: dict[str, Any] | np.ndarray,
+    env_indices: np.ndarray,
+    num_envs: int,
+    key: str | None = None,
+) -> dict[str, Any] | np.ndarray:
+    if isinstance(frame, dict):
+        return {
+            child_key: _expand_partial_frame(
+                value, env_indices, num_envs, child_key
+            )
+            for child_key, value in frame.items()
+        }
+
+    expanded = np.full(
+        (frame.shape[0], num_envs, *frame.shape[2:]),
+        _partial_frame_fill_value(key, frame.dtype),
+        dtype=frame.dtype,
+    )
+    expanded[:, env_indices] = frame
+    return expanded
+
+
+def _partial_frame_fill_value(key: str | None, dtype: np.dtype) -> int | bool:
+    if np.issubdtype(dtype, np.bool_):
+        return False
+    if key in ("phase_id", "point_uv", "grasp_rect_uv"):
+        return -1
+    return 0
+
+
+def _get_env_num_envs(env) -> int:
+    return max(int(getattr(env, "num_envs", 1)), 1)
 
 
 def _write_tree_to_h5(
