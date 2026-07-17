@@ -78,6 +78,7 @@ class _PreviousAnnotation:
         context.target_gripper_width_valid[row] = self.target_gripper_width_valid
         context.active_object[row] = self.active_object
         context.target_object[row] = self.target_object
+        context.task_meta.update(self.task_meta)
 
 
 class SkillAnnotationManager:
@@ -285,6 +286,7 @@ def _write_context_row(
     dst.target_gripper_width_valid[dst_row] = src.target_gripper_width_valid[src_row]
     dst.active_object[dst_row] = src.active_object[src_row]
     dst.target_object[dst_row] = src.target_object[src_row]
+    dst.task_meta.update(src.task_meta)
 
 
 def _build_projection_bundle(

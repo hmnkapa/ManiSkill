@@ -178,6 +178,7 @@ def test_manager_previous_cache_falls_back_when_target_is_missing():
         target_gripper_width=torch.tensor([0.04]),
         active_object="cube",
         target_object="cube",
+        task_meta={"task": "cache-test"},
     )
     missing_target_context = SkillAnnotationContext(skill="place", phase_id=99)
     env = _ContextSequenceEnv([valid_context, missing_target_context, missing_target_context])
@@ -187,6 +188,7 @@ def test_manager_previous_cache_falls_back_when_target_is_missing():
     assert first["skill_id"].tolist() == [SKILL_IDS["pick"]]
     assert first["phase_id"].tolist() == [42]
     assert first["target"]["point_valid"].tolist() == [True]
+    assert first["task_meta"] == {"task": "cache-test"}
 
     fallback = get_annotation_bundle(env)
     assert fallback["skill"] == ["pick"]
@@ -194,6 +196,7 @@ def test_manager_previous_cache_falls_back_when_target_is_missing():
     assert fallback["phase_id"].tolist() == [42]
     assert fallback["debug"]["used_previous"].tolist() == [True]
     assert torch.allclose(fallback["target"]["point_world"], first["target"]["point_world"])
+    assert fallback["task_meta"] == {"task": "cache-test"}
 
     no_fallback = get_annotation_bundle(env, use_previous=False)
     assert no_fallback["skill"] == ["none"]
@@ -217,6 +220,7 @@ def test_pick_cube_style_context_shapes_for_grasp_and_not_grasp():
     assert bundle["target"]["point_valid"].tolist() == [True, True]
     assert bundle["active_object"] == ["cube", "cube"]
     assert bundle["target_object"] == ["cube", "goal"]
+    assert bundle["task_meta"] == {"task": "PickCube-style"}
 
     for env_idx in (1, [1], (1,), np.array([1]), torch.tensor([1])):
         single = get_annotation_bundle_for_env(env, env_idx)
@@ -227,6 +231,7 @@ def test_pick_cube_style_context_shapes_for_grasp_and_not_grasp():
         assert single["phase_id"].tolist() == [20]
         assert single["target"]["point_world"].shape == (1, 3)
         assert single["target"]["pose_world"].shape == (1, 4, 4)
+        assert single["task_meta"] == {"task": "PickCube-style"}
 
 
 def test_reset_skill_annotator_accepts_supported_env_idx_types():
