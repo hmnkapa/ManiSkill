@@ -22,6 +22,7 @@ mani_skill /envs/tasks/push_cube.py which is annotated with comments to explain 
 """
 
 
+from enum import IntEnum
 from typing import Any, Union
 
 import numpy as np
@@ -36,7 +37,97 @@ from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
 from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
+
+
+class TemplateSkillPhase(IntEnum):
+    PICK = 0
+    PLACE = 1
+    DONE = 2
+
+
+class TemplateSkillFSM:
+    """Template for per-task explicit skill annotation state machines.
+
+    The task FSM owns phase transitions, skill selection, task-specific 3D target
+    selection, and task-specific debug metadata.
+
+    The generic mani_skill/utils/skill_annotation/manager.py owns previous
+    skill/target caching, batch bundle generation, camera projection,
+    visualization entry points, and HDF5-friendly formatting.
+    """
+
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(TemplateSkillPhase.PICK),
+            dtype=torch.long,
+            device=device,
+        )
+
+    def reset(self, env_idx=None):
+        # Reset phase for all envs or selected env_idx.
+        if env_idx is None:
+            self.phase.fill_(int(TemplateSkillPhase.PICK))
+        else:
+            self.phase[env_idx] = int(TemplateSkillPhase.PICK)
+
+    def update(self, env, env_idx=None):
+        # Read task-specific state from env and update self.phase.
+        # Example transitions:
+        # PICK -> PLACE when object is grasped
+        # PLACE -> DONE when task succeeds
+        # PLACE -> PICK when object is dropped before success
+        pass
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        # Convert current phase into a SkillAnnotationContext.
+        # This method should only produce task semantics and 3D targets in
+        # world coordinates. Do not project to camera, cache previous targets,
+        # visualize, or write HDF5 from a task FSM.
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[phase == int(TemplateSkillPhase.PICK)] = SKILL_IDS["pick"]
+        skill_id[phase == int(TemplateSkillPhase.PLACE)] = SKILL_IDS["place"]
+
+        phase_names_by_id = {
+            int(TemplateSkillPhase.PICK): "pick",
+            int(TemplateSkillPhase.PLACE): "place",
+            int(TemplateSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(TemplateSkillPhase.PICK): "pick",
+            int(TemplateSkillPhase.PLACE): "place",
+            int(TemplateSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(TemplateSkillPhase.PICK): "move_to_pick_target",
+            int(TemplateSkillPhase.PLACE): "move_to_place_target",
+            int(TemplateSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+
+        # In a real task, replace the None target fields with task-specific
+        # world-frame tensors/Pose objects, optionally sliced by env_idx.
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=None,
+            target_pose_world=None,
+            target_gripper_width=None,
+            active_object=["template_active_object"] * len(phase_ids),
+            target_object=["template_target_object"] * len(phase_ids),
+            task_meta={
+                "source": "template",
+                "target_frame": "world",
+            },
+        )
 
 
 # register the environment by a unique ID and specify a max time limit. Now once this file is imported you can do gym.make("CustomEnv-v0")
@@ -148,7 +239,31 @@ class CustomEnv(BaseEnv):
     """
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
-        pass
+        # Initialize all task state for env_idx here.
+
+        # Reset skill FSM after episode state initialization.
+        self._get_or_create_skill_annotation_fsm().reset(env_idx)
+
+    """
+    Skill Annotation Code
+
+    A task exposes exactly one public entry point for skill annotation:
+    get_skill_annotation_context(self, env_idx=None). The generic skill
+    annotation manager consumes only the returned SkillAnnotationContext and
+    does not need to understand any task-specific FSM logic.
+    """
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, TemplateSkillFSM):
+            fsm = TemplateSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     """
     Modifying observations, goal parameterization, and success conditions for your task
