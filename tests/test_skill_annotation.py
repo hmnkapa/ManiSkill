@@ -14,6 +14,7 @@ from mani_skill.utils.skill_annotation import (
     normalize_skill_context,
     project_3d_to_2d,
     project_pose_to_grasp_annotation_2d,
+    reset_skill_annotator,
     skill_to_id,
 )
 
@@ -217,14 +218,30 @@ def test_pick_cube_style_context_shapes_for_grasp_and_not_grasp():
     assert bundle["active_object"] == ["cube", "cube"]
     assert bundle["target_object"] == ["cube", "goal"]
 
-    single = get_annotation_bundle_for_env(env, torch.tensor([1]))
-    assert single["skill"] == ["place"]
-    assert single["skill_id"].shape == (1,)
-    assert single["skill_id"].tolist() == [SKILL_IDS["place"]]
-    assert single["phase_id"].shape == (1,)
-    assert single["phase_id"].tolist() == [20]
-    assert single["target"]["point_world"].shape == (1, 3)
-    assert single["target"]["pose_world"].shape == (1, 4, 4)
+    for env_idx in (1, [1], (1,), np.array([1]), torch.tensor([1])):
+        single = get_annotation_bundle_for_env(env, env_idx)
+        assert single["skill"] == ["place"]
+        assert single["skill_id"].shape == (1,)
+        assert single["skill_id"].tolist() == [SKILL_IDS["place"]]
+        assert single["phase_id"].shape == (1,)
+        assert single["phase_id"].tolist() == [20]
+        assert single["target"]["point_world"].shape == (1, 3)
+        assert single["target"]["pose_world"].shape == (1, 4, 4)
+
+
+def test_reset_skill_annotator_accepts_supported_env_idx_types():
+    env = _PickCubeStyleProviderEnv()
+
+    for env_idx in (1, [1], (1,), np.array([1]), torch.tensor([1])):
+        get_annotation_bundle(env)
+        manager = env._skill_annotation_manager
+        assert manager._previous[0] is not None
+        assert manager._previous[1] is not None
+
+        reset_skill_annotator(env, env_idx)
+
+        assert manager._previous[0] is not None
+        assert manager._previous[1] is None
 
 
 def test_skill_annotation_episode_recorder_flushes_t_plus_one_and_projection(tmp_path):
@@ -347,7 +364,7 @@ class _PickCubeStyleProviderEnv:
         elif torch.is_tensor(env_idx):
             indices = env_idx.flatten().long()
         else:
-            indices = torch.tensor([env_idx], dtype=torch.long)
+            indices = torch.as_tensor(env_idx, dtype=torch.long).reshape(-1)
 
         is_grasped = self.is_grasped[indices]
         target_point = torch.where(

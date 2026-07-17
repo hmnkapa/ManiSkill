@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeAlias
 
+import numpy as np
 import torch
 
 from mani_skill.utils.skill_annotation.projection import (
@@ -20,6 +21,8 @@ from mani_skill.utils.skill_annotation.schema import (
     normalize_skill_context,
     select_normalized_context,
 )
+
+EnvIndex: TypeAlias = int | list[int] | tuple[int, ...] | np.ndarray | torch.Tensor
 
 
 @dataclass
@@ -94,7 +97,7 @@ class SkillAnnotationManager:
         else:
             self._previous = self._previous[:num_envs]
 
-    def reset(self, env_idx: int | torch.Tensor | None = None) -> None:
+    def reset(self, env_idx: EnvIndex | None = None) -> None:
         if env_idx is None:
             self._previous = [None] * self.num_envs
             return
@@ -106,18 +109,21 @@ class SkillAnnotationManager:
         env,
         cameras: str | Sequence[str] | Mapping[str, Mapping[str, Any]] | None = None,
         use_previous: bool = True,
-        env_idx: int | torch.Tensor | None = None,
+        env_idx: EnvIndex | None = None,
     ) -> SkillAnnotationBundle:
         total_num_envs = _get_env_num_envs(env)
+        device = _get_env_device(env)
         self.ensure_num_envs(total_num_envs)
         indices = _normalize_env_indices(env_idx, total_num_envs)
-        raw_context = _get_raw_context(env, env_idx)
+        raw_context = _get_raw_context(
+            env, _normalize_env_idx_for_context(env_idx, device)
+        )
         normalized = _normalize_context_for_indices(
             raw_context,
             indices,
             env_idx,
             total_num_envs,
-            _get_env_device(env),
+            device,
         )
         effective, used_previous, current_valid = self._apply_previous_cache(
             normalized, indices, use_previous=use_previous
@@ -182,7 +188,7 @@ def get_annotation_bundle(
 
 def get_annotation_bundle_for_env(
     env,
-    env_idx: int | torch.Tensor,
+    env_idx: EnvIndex,
     cameras: str | Sequence[str] | Mapping[str, Mapping[str, Any]] | None = None,
     use_previous: bool = True,
 ) -> SkillAnnotationBundle:
@@ -195,12 +201,12 @@ def get_annotation_bundle_for_env(
     )
 
 
-def reset_skill_annotator(env, env_idx: int | torch.Tensor | None = None) -> None:
+def reset_skill_annotator(env, env_idx: EnvIndex | None = None) -> None:
     manager = _get_or_create_manager(env)
     manager.reset(env_idx=env_idx)
 
 
-def get_skill_label(env, env_idx: int | torch.Tensor = 0) -> str:
+def get_skill_label(env, env_idx: EnvIndex = 0) -> str:
     bundle = get_annotation_bundle_for_env(env, env_idx=env_idx)
     return bundle["skill"][0] if bundle["skill"] else "none"
 
@@ -216,7 +222,7 @@ def _get_or_create_manager(env) -> SkillAnnotationManager:
     return manager
 
 
-def _get_raw_context(env, env_idx: int | torch.Tensor | None):
+def _get_raw_context(env, env_idx: EnvIndex | None):
     if not hasattr(env, "get_skill_annotation_context"):
         raise AttributeError(
             "Skill annotation requires env.get_skill_annotation_context(env_idx=None)"
@@ -229,7 +235,7 @@ def _normalize_context_for_indices(
         SkillAnnotationContext | Mapping[str, Any] | NormalizedSkillAnnotationContext | None
     ),
     indices: Sequence[int],
-    requested_env_idx: int | torch.Tensor | None,
+    requested_env_idx: EnvIndex | None,
     total_num_envs: int,
     device: torch.device,
 ) -> NormalizedSkillAnnotationContext:
@@ -395,18 +401,30 @@ def _get_camera_image_size(env, camera_name: str, params: Mapping[str, Any]) -> 
     )
 
 
-def _normalize_env_indices(env_idx: int | torch.Tensor | None, num_envs: int) -> list[int]:
+def _normalize_env_indices(env_idx: EnvIndex | None, num_envs: int) -> list[int]:
     if env_idx is None:
         indices = list(range(num_envs))
     elif torch.is_tensor(env_idx):
         indices = [int(i) for i in env_idx.detach().cpu().flatten().tolist()]
     else:
-        indices = [int(env_idx)]
+        indices = [int(i) for i in torch.as_tensor(env_idx).flatten().tolist()]
 
     for idx in indices:
         if idx < 0 or idx >= num_envs:
             raise IndexError(f"env_idx {idx} is out of range for num_envs={num_envs}")
     return indices
+
+
+def _normalize_env_idx_for_context(
+    env_idx: EnvIndex | None, device: torch.device
+) -> int | torch.Tensor | None:
+    if env_idx is None:
+        return None
+    if torch.is_tensor(env_idx):
+        return env_idx.to(device=device, dtype=torch.long).flatten()
+    if isinstance(env_idx, (int, np.integer)):
+        return int(env_idx)
+    return torch.as_tensor(env_idx, device=device, dtype=torch.long).flatten()
 
 
 def _get_env_num_envs(env) -> int:
