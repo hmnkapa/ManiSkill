@@ -2,7 +2,7 @@ import copy
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Mapping, Optional, Sequence, Union
 
 import gymnasium as gym
 import h5py
@@ -15,6 +15,7 @@ from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils import common, gym_utils, sapien_utils
 from mani_skill.utils.io_utils import dump_json
 from mani_skill.utils.logging_utils import logger
+from mani_skill.utils.skill_annotation.record import SkillAnnotationEpisodeRecorder
 from mani_skill.utils.structs.types import Array
 from mani_skill.utils.visualization.misc import (
     images_to_video,
@@ -211,6 +212,9 @@ class RecordEpisode(gym.Wrapper):
         avoid_overwriting_video (bool): If true, the wrapper will iterate over possible video names to avoid overwriting existing videos in the output directory. Useful for resuming training runs.
         source_type (Optional[str]): a word to describe the source of the actions used to record episodes (e.g. RL, motionplanning, teleoperation)
         source_desc (Optional[str]): A longer description describing how the demonstrations are collected
+        record_skill_annotations (bool): whether to record skill annotations under each trajectory's skill_annotations group.
+        skill_annotation_cameras: optional camera names or camera parameter mapping forwarded to the skill annotation API.
+        skill_annotation_use_previous (bool): whether the skill annotation API should use its previous valid annotation fallback.
     """
 
     def __init__(
@@ -232,6 +236,11 @@ class RecordEpisode(gym.Wrapper):
         avoid_overwriting_video: bool = False,
         source_type: Optional[str] = None,
         source_desc: Optional[str] = None,
+        record_skill_annotations: bool = False,
+        skill_annotation_cameras: Optional[
+            Union[str, Sequence[str], Mapping[str, Mapping[str, Any]]]
+        ] = None,
+        skill_annotation_use_previous: bool = True,
     ) -> None:
         super().__init__(env)
 
@@ -264,6 +273,15 @@ class RecordEpisode(gym.Wrapper):
         self.clean_on_close = clean_on_close
         self.record_reward = record_reward
         self.record_env_state = record_env_state
+        self.record_skill_annotations = bool(record_skill_annotations and save_trajectory)
+        self._skill_annotation_recorder = (
+            SkillAnnotationEpisodeRecorder(
+                cameras=skill_annotation_cameras,
+                use_previous=skill_annotation_use_previous,
+            )
+            if self.record_skill_annotations
+            else None
+        )
         if self.save_trajectory:
             if not trajectory_name:
                 trajectory_name = time.strftime("%Y%m%d_%H%M%S")
@@ -380,6 +398,8 @@ class RecordEpisode(gym.Wrapper):
             # if we reconfigure, there is the possibility that state dictionary looks different now
             # so trajectory buffer must be wiped
             self._trajectory_buffer = None
+            if self._skill_annotation_recorder is not None:
+                self._skill_annotation_recorder.clear()
         if self.save_trajectory:
             state_dict = self.base_env.get_state_dict()
             action = common.batch(
@@ -454,6 +474,8 @@ class RecordEpisode(gym.Wrapper):
                     )
                 if self._trajectory_buffer.fail is not None:
                     recursive_replace(self._trajectory_buffer.fail, first_step.fail)
+            if self._skill_annotation_recorder is not None:
+                self._skill_annotation_recorder.reset(self.base_env, env_idx=env_idx)
         if options is not None and "env_idx" in options:
             options["env_idx"] = common.to_numpy(options["env_idx"])
         self.last_reset_kwargs = copy.deepcopy(dict(options=options, **kwargs))
@@ -516,6 +538,8 @@ class RecordEpisode(gym.Wrapper):
                 )
             else:
                 self._trajectory_buffer.fail = None
+            if self._skill_annotation_recorder is not None:
+                self._skill_annotation_recorder.step(self.base_env)
 
         if self.save_video:
             self._video_steps += 1
@@ -703,6 +727,10 @@ class RecordEpisode(gym.Wrapper):
                         ],
                         dtype=np.float32,
                     )
+                if self._skill_annotation_recorder is not None:
+                    self._skill_annotation_recorder.flush_to_h5(
+                        group, start_ptr, end_ptr, env_idx
+                    )
 
                 self._json_data["episodes"].append(common.to_numpy(episode_info))
                 dump_json(self._json_path, self._json_data, indent=2)
@@ -721,38 +749,41 @@ class RecordEpisode(gym.Wrapper):
             )
             min_env_ptr = self._trajectory_buffer.env_episode_ptr.min()
             N = len(self._trajectory_buffer.done)
+            truncate_slice = slice(min_env_ptr, N)
 
             if self.record_env_state:
                 self._trajectory_buffer.state = common.index_dict_array(
-                    self._trajectory_buffer.state, slice(min_env_ptr, N)
+                    self._trajectory_buffer.state, truncate_slice
                 )
             self._trajectory_buffer.observation = common.index_dict_array(
-                self._trajectory_buffer.observation, slice(min_env_ptr, N)
+                self._trajectory_buffer.observation, truncate_slice
             )
             self._trajectory_buffer.action = common.index_dict_array(
-                self._trajectory_buffer.action, slice(min_env_ptr, N)
+                self._trajectory_buffer.action, truncate_slice
             )
             if self.record_reward:
                 self._trajectory_buffer.reward = common.index_dict_array(
-                    self._trajectory_buffer.reward, slice(min_env_ptr, N)
+                    self._trajectory_buffer.reward, truncate_slice
                 )
             self._trajectory_buffer.terminated = common.index_dict_array(
-                self._trajectory_buffer.terminated, slice(min_env_ptr, N)
+                self._trajectory_buffer.terminated, truncate_slice
             )
             self._trajectory_buffer.truncated = common.index_dict_array(
-                self._trajectory_buffer.truncated, slice(min_env_ptr, N)
+                self._trajectory_buffer.truncated, truncate_slice
             )
             self._trajectory_buffer.done = common.index_dict_array(
-                self._trajectory_buffer.done, slice(min_env_ptr, N)
+                self._trajectory_buffer.done, truncate_slice
             )
             if self._trajectory_buffer.success is not None:
                 self._trajectory_buffer.success = common.index_dict_array(
-                    self._trajectory_buffer.success, slice(min_env_ptr, N)
+                    self._trajectory_buffer.success, truncate_slice
                 )
             if self._trajectory_buffer.fail is not None:
                 self._trajectory_buffer.fail = common.index_dict_array(
-                    self._trajectory_buffer.fail, slice(min_env_ptr, N)
+                    self._trajectory_buffer.fail, truncate_slice
                 )
+            if self._skill_annotation_recorder is not None:
+                self._skill_annotation_recorder.truncate(truncate_slice)
             self._trajectory_buffer.env_episode_ptr -= min_env_ptr
 
     def flush_video(

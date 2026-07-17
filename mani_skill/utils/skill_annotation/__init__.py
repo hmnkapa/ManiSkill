@@ -11,6 +11,7 @@ from mani_skill.utils.skill_annotation.projection import (
     project_3d_to_2d,
     project_pose_to_grasp_annotation_2d,
 )
+from mani_skill.utils.skill_annotation.record import SkillAnnotationEpisodeRecorder
 from mani_skill.utils.skill_annotation.schema import (
     SKILL_IDS,
     SKILL_NAMES,
@@ -34,6 +35,7 @@ __all__ = [
     "SKILL_VOCAB",
     "SkillAnnotationBundle",
     "SkillAnnotationContext",
+    "SkillAnnotationEpisodeRecorder",
     "SkillAnnotationManager",
     "build_grasp_rect_corners_3d",
     "draw_grasp_annotation_on_image",

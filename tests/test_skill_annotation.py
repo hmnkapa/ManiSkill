@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 import torch
 
@@ -5,6 +6,7 @@ from mani_skill.utils.skill_annotation import (
     SKILL_IDS,
     SKILL_NAMES,
     SKILL_VOCAB,
+    SkillAnnotationEpisodeRecorder,
     SkillAnnotationContext,
     get_annotation_bundle,
     get_annotation_bundle_for_env,
@@ -225,6 +227,97 @@ def test_pick_cube_style_context_shapes_for_grasp_and_not_grasp():
     assert single["target"]["pose_world"].shape == (1, 4, 4)
 
 
+def test_skill_annotation_episode_recorder_flushes_t_plus_one_and_projection(tmp_path):
+    import h5py
+
+    env = _ProjectingSkillAnnotationEnv()
+    recorder = SkillAnnotationEpisodeRecorder(cameras=["base_camera"])
+
+    recorder.reset(env)
+    assert len(recorder) == 1
+    recorder.step(env)
+    assert len(recorder) == 2
+
+    path = tmp_path / "annotations.h5"
+    with h5py.File(path, "w") as h5_file:
+        group = h5_file.create_group("traj_0")
+        recorder.flush_to_h5(group, start_ptr=0, end_ptr=2, env_idx=1)
+
+        annotations = group["skill_annotations"]
+        assert "skill" not in annotations
+        assert "phase" not in annotations
+        assert "skill_vocab" in annotations.attrs
+        assert annotations["skill_id"].shape == (2,)
+        assert annotations["skill_id"][:].tolist() == [SKILL_IDS["place"], SKILL_IDS["place"]]
+        assert annotations["phase_id"].shape == (2,)
+        assert annotations["phase_id"][:].tolist() == [20, 21]
+        assert annotations["target"]["point_world"].shape == (2, 3)
+        assert annotations["target"]["pose_world"].shape == (2, 4, 4)
+        assert annotations["projection"]["base_camera"]["point_uv"].shape == (2, 2)
+        assert annotations["projection"]["base_camera"]["point_visible"].shape == (2,)
+        assert annotations["projection"]["base_camera"]["grasp_rect_uv"].shape == (2, 4, 2)
+        assert annotations["projection"]["base_camera"]["grasp_visible"].shape == (2,)
+
+
+def test_skill_annotation_episode_recorder_partial_reset_replaces_selected_env():
+    env = _ProjectingSkillAnnotationEnv()
+    recorder = SkillAnnotationEpisodeRecorder()
+
+    recorder.reset(env)
+    recorder.step(env)
+    recorder.reset(env, env_idx=np.array([0]))
+
+    assert len(recorder) == 2
+    assert recorder.buffer["phase_id"][:, 0].tolist() == [10, 12]
+    assert recorder.buffer["phase_id"][:, 1].tolist() == [20, 21]
+
+
+def test_record_episode_writes_skill_annotations_when_enabled(tmp_path):
+    import h5py
+
+    from mani_skill.utils.wrappers import RecordEpisode
+
+    env = RecordEpisode(
+        _make_record_skill_annotation_env(),
+        output_dir=str(tmp_path),
+        trajectory_name="enabled",
+        save_video=False,
+        clean_on_close=False,
+        record_skill_annotations=True,
+    )
+
+    env.reset()
+    env.step(env.action_space.sample())
+    env.close()
+
+    with h5py.File(tmp_path / "enabled.h5", "r") as h5_file:
+        annotations = h5_file["traj_0"]["skill_annotations"]
+        assert annotations["skill_id"].shape == (2,)
+        assert annotations["phase_id"].shape == (2,)
+        assert annotations["phase_id"][:].tolist() == [0, 1]
+
+
+def test_record_episode_does_not_write_skill_annotations_by_default(tmp_path):
+    import h5py
+
+    from mani_skill.utils.wrappers import RecordEpisode
+
+    env = RecordEpisode(
+        _make_record_skill_annotation_env(),
+        output_dir=str(tmp_path),
+        trajectory_name="disabled",
+        save_video=False,
+        clean_on_close=False,
+    )
+
+    env.reset()
+    env.step(env.action_space.sample())
+    env.close()
+
+    with h5py.File(tmp_path / "disabled.h5", "r") as h5_file:
+        assert "skill_annotations" not in h5_file["traj_0"]
+
+
 class _ContextSequenceEnv:
     num_envs = 1
     device = "cpu"
@@ -286,3 +379,107 @@ class _PickCubeStyleProviderEnv:
             target_object=["goal" if bool(item) else "cube" for item in is_grasped],
             task_meta={"task": "PickCube-style"},
         )
+
+
+class _ProjectingSkillAnnotationEnv:
+    num_envs = 2
+    device = "cpu"
+
+    def __init__(self):
+        self._call_idx = 0
+
+    def get_skill_annotation_context(self, env_idx=None):
+        if env_idx is None:
+            indices = torch.arange(self.num_envs)
+        elif torch.is_tensor(env_idx):
+            indices = env_idx.flatten().long()
+        else:
+            indices = torch.as_tensor(env_idx, dtype=torch.long).reshape(-1)
+
+        call_idx = self._call_idx
+        self._call_idx += 1
+        base_phase_ids = torch.tensor([10, 20], dtype=torch.long)
+        target_point = torch.tensor(
+            [
+                [0.0, 0.0, 1.0],
+                [0.1, 0.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )[indices]
+        target_pose = torch.eye(4)[None].repeat(len(indices), 1, 1)
+        target_pose[:, :3, 3] = target_point
+        skills = ["pick" if int(idx) == 0 else "place" for idx in indices]
+
+        return SkillAnnotationContext(
+            skill=skills,
+            phase_id=base_phase_ids[indices] + call_idx,
+            target_point_world=target_point,
+            target_pose_world=target_pose,
+            target_gripper_width=torch.full((len(indices),), 0.04),
+        )
+
+    def get_sensor_params(self):
+        intrinsic = torch.tensor(
+            [[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float32,
+        )
+        extrinsic = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+            dtype=torch.float32,
+        )
+        return {
+            "base_camera": {
+                "intrinsic_cv": intrinsic[None].repeat(self.num_envs, 1, 1),
+                "extrinsic_cv": extrinsic[None].repeat(self.num_envs, 1, 1),
+                "image_size": (100, 100),
+            }
+        }
+
+
+def _make_record_skill_annotation_env():
+    import gymnasium as gym
+
+    class RecordSkillAnnotationEnv(gym.Env):
+        num_envs = 1
+        device = "cpu"
+        control_mode = "mock"
+
+        def __init__(self):
+            self.t = 0
+            self._episode_seed = [0]
+            self.single_action_space = gym.spaces.Box(
+                low=-1.0, high=1.0, shape=(1,), dtype=np.float32
+            )
+            self.action_space = self.single_action_space
+            self.observation_space = gym.spaces.Box(
+                low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32
+            )
+
+        def reset(self, *, seed=None, options=None):
+            self.t = 0
+            return np.array([float(self.t)], dtype=np.float32), {"reconfigure": False}
+
+        def step(self, action):
+            self.t += 1
+            obs = np.array([float(self.t)], dtype=np.float32)
+            return obs, 0.0, False, False, {}
+
+        def get_state_dict(self):
+            return {
+                "actors": {
+                    "mock": np.array([[float(self.t)]], dtype=np.float32),
+                }
+            }
+
+        def get_skill_annotation_context(self, env_idx=None):
+            target_pose = torch.eye(4)[None]
+            target_pose[:, 2, 3] = 1.0
+            return SkillAnnotationContext(
+                skill="pick",
+                phase_id=self.t,
+                target_point_world=torch.tensor([[float(self.t), 0.0, 1.0]]),
+                target_pose_world=target_pose,
+                target_gripper_width=torch.tensor([0.04]),
+            )
+
+    return RecordSkillAnnotationEnv()
