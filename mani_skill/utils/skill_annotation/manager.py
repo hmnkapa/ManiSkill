@@ -27,6 +27,7 @@ class _PreviousAnnotation:
     skill: str
     skill_id: int
     skill_state: str | None
+    phase_id: int
     phase: str | None
     target_point_world: torch.Tensor
     target_point_valid: bool
@@ -46,6 +47,7 @@ class _PreviousAnnotation:
             skill=context.skill[row],
             skill_id=int(context.skill_id[row].item()),
             skill_state=context.skill_state[row],
+            phase_id=int(context.phase_id[row].item()),
             phase=context.phase[row],
             target_point_world=context.target_point_world[row].detach().clone(),
             target_point_valid=bool(context.target_point_valid[row].item()),
@@ -63,6 +65,7 @@ class _PreviousAnnotation:
         context.skill[row] = self.skill
         context.skill_id[row] = self.skill_id
         context.skill_state[row] = self.skill_state
+        context.phase_id[row] = self.phase_id
         context.phase[row] = self.phase
         context.target_point_world[row] = self.target_point_world.to(device=device)
         context.target_point_valid[row] = self.target_point_valid
@@ -130,6 +133,7 @@ class SkillAnnotationManager:
             "skill_id": effective.skill_id,
             "skill": effective.skill,
             "skill_state": effective.skill_state,
+            "phase_id": effective.phase_id,
             "phase": effective.phase,
             "active_object": effective.active_object,
             "target_object": effective.target_object,
@@ -265,6 +269,7 @@ def _write_context_row(
     dst.skill[dst_row] = src.skill[src_row]
     dst.skill_id[dst_row] = src.skill_id[src_row]
     dst.skill_state[dst_row] = src.skill_state[src_row]
+    dst.phase_id[dst_row] = src.phase_id[src_row]
     dst.phase[dst_row] = src.phase[src_row]
     dst.target_point_world[dst_row] = src.target_point_world[src_row]
     dst.target_point_valid[dst_row] = src.target_point_valid[src_row]

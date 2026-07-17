@@ -8,9 +8,18 @@ import torch
 from mani_skill.utils.structs.pose import Pose
 
 
-SKILL_VOCAB = ("none", "pick", "place", "insert", "screw", "push")
-SKILL_NAME_TO_ID = {skill: i for i, skill in enumerate(SKILL_VOCAB)}
-SKILL_ID_TO_NAME = {i: skill for i, skill in enumerate(SKILL_VOCAB)}
+SKILL_IDS = {
+    "none": 0,
+    "pick": 1,
+    "place": 2,
+    "insert": 3,
+    "screw": 4,
+    "push": 5,
+}
+SKILL_NAMES = {skill_id: skill for skill, skill_id in SKILL_IDS.items()}
+SKILL_VOCAB = tuple(SKILL_IDS.keys())
+SKILL_NAME_TO_ID = SKILL_IDS
+SKILL_ID_TO_NAME = SKILL_NAMES
 
 
 class TargetBundle(TypedDict):
@@ -33,6 +42,7 @@ class SkillAnnotationBundle(TypedDict, total=False):
     skill_id: torch.Tensor
     skill: list[str]
     skill_state: list[Optional[str]]
+    phase_id: torch.Tensor
     phase: list[Optional[str]]
     active_object: list[Optional[str]]
     target_object: list[Optional[str]]
@@ -45,8 +55,9 @@ class SkillAnnotationBundle(TypedDict, total=False):
 @dataclass
 class SkillAnnotationContext:
     skill: str | list[str] | None = None
-    skill_id: torch.Tensor | None = None
+    skill_id: torch.Tensor | int | list[int] | None = None
     skill_state: str | list[str] | None = None
+    phase_id: torch.Tensor | int | list[int] | None = None
     phase: str | list[str] | None = None
     target_point_world: torch.Tensor | None = None
     target_pose_world: Pose | torch.Tensor | None = None
@@ -61,6 +72,7 @@ class NormalizedSkillAnnotationContext:
     skill: list[str]
     skill_id: torch.Tensor
     skill_state: list[Optional[str]]
+    phase_id: torch.Tensor
     phase: list[Optional[str]]
     target_point_world: torch.Tensor
     target_point_valid: torch.Tensor
@@ -118,6 +130,7 @@ def normalize_skill_context(
     device = torch.device(device) if device is not None else _infer_device(context)
     skill, skill_id = _normalize_skill(context.skill, context.skill_id, n, device)
     skill_state = _normalize_optional_string_list(context.skill_state, n, "skill_state")
+    phase_id = _normalize_phase_id(context.phase_id, n, device)
     phase = _normalize_optional_string_list(context.phase, n, "phase")
     active_object = _normalize_optional_string_list(context.active_object, n, "active_object")
     target_object = _normalize_optional_string_list(context.target_object, n, "target_object")
@@ -131,6 +144,7 @@ def normalize_skill_context(
         skill=skill,
         skill_id=skill_id,
         skill_state=skill_state,
+        phase_id=phase_id,
         phase=phase,
         target_point_world=point_world,
         target_point_valid=point_valid,
@@ -165,6 +179,7 @@ def select_normalized_context(
         skill=[context.skill[i] for i in index_list],
         skill_id=context.skill_id[index_tensor].clone(),
         skill_state=[context.skill_state[i] for i in index_list],
+        phase_id=context.phase_id[index_tensor].clone(),
         phase=[context.phase[i] for i in index_list],
         target_point_world=context.target_point_world[index_tensor].clone(),
         target_point_valid=context.target_point_valid[index_tensor].clone(),
@@ -192,6 +207,7 @@ def make_target_bundle(context: NormalizedSkillAnnotationContext) -> TargetBundl
 def _infer_device(context: SkillAnnotationContext) -> torch.device:
     for value in (
         context.skill_id,
+        context.phase_id,
         context.target_point_world,
         context.target_pose_world,
         context.target_gripper_width,
@@ -217,6 +233,11 @@ def _infer_num_envs(context: SkillAnnotationContext) -> int:
     if context.skill_id is not None:
         ids = torch.as_tensor(context.skill_id)
         candidates.append(1 if ids.ndim == 0 else int(ids.reshape(-1).shape[0]))
+    if context.phase_id is not None:
+        phase_ids = torch.as_tensor(context.phase_id)
+        candidates.append(
+            1 if phase_ids.ndim == 0 else int(phase_ids.reshape(-1).shape[0])
+        )
     if context.target_point_world is not None:
         point = torch.as_tensor(context.target_point_world)
         candidates.append(1 if point.ndim == 1 else int(point.shape[0]))
@@ -239,7 +260,7 @@ def _infer_num_envs(context: SkillAnnotationContext) -> int:
 
 def _normalize_skill(
     skill: str | Sequence[str | None] | None,
-    skill_id: torch.Tensor | None,
+    skill_id: torch.Tensor | int | Sequence[int] | None,
     num_envs: int,
     device: torch.device,
 ) -> tuple[list[str], torch.Tensor]:
@@ -251,10 +272,9 @@ def _normalize_skill(
         id_from_input = _broadcast_first_dim(id_from_input, num_envs, "skill_id")
         for item in id_from_input.detach().cpu().tolist():
             id_to_skill(int(item))
+        return [id_to_skill(i) for i in id_from_input.detach().cpu().tolist()], id_from_input
 
     if skill is None:
-        if id_from_input is not None:
-            return [id_to_skill(i) for i in id_from_input.detach().cpu().tolist()], id_from_input
         skill_names = ["none"] * num_envs
     elif isinstance(skill, str):
         skill_names = [skill] * num_envs
@@ -270,6 +290,22 @@ def _normalize_skill(
     if id_from_input is not None and not torch.equal(ids, id_from_input):
         raise ValueError("skill and skill_id disagree")
     return skill_names, ids
+
+
+def _normalize_phase_id(
+    phase_id: torch.Tensor | int | Sequence[int] | None,
+    num_envs: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if phase_id is None:
+        return torch.full((num_envs,), -1, device=device, dtype=torch.long)
+
+    phase_id_tensor = torch.as_tensor(
+        phase_id, device=device, dtype=torch.long
+    ).flatten()
+    if phase_id_tensor.numel() == 0:
+        raise ValueError("phase_id cannot be empty")
+    return _broadcast_first_dim(phase_id_tensor, num_envs, "phase_id")
 
 
 def _normalize_optional_string_list(

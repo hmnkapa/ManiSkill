@@ -12,6 +12,8 @@ from mani_skill.utils.skill_annotation.projection import (
     project_pose_to_grasp_annotation_2d,
 )
 from mani_skill.utils.skill_annotation.schema import (
+    SKILL_IDS,
+    SKILL_NAMES,
     SKILL_VOCAB,
     SkillAnnotationBundle,
     SkillAnnotationContext,
@@ -27,6 +29,8 @@ from mani_skill.utils.skill_annotation.visualization import (
 
 __all__ = [
     "PandaState",
+    "SKILL_IDS",
+    "SKILL_NAMES",
     "SKILL_VOCAB",
     "SkillAnnotationBundle",
     "SkillAnnotationContext",
