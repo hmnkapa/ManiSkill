@@ -49,6 +49,8 @@ class Args:
     """Whether to print verbose information during trajectory replays"""
     save_traj: bool = False
     """Whether to save trajectories to disk. This will not override the original trajectory file."""
+    output_traj_name: Optional[str] = None
+    """Optional name for the saved replay trajectory file, without the .h5 suffix."""
     save_video: bool = False
     """Whether to save videos"""
     max_retry: int = 0
@@ -73,6 +75,10 @@ class Args:
     support 'sparse', 'none', and some further support 'normalized_dense' and 'dense' reward modes"""
     record_rewards: bool = False
     """Whether the replayed trajectory should include rewards"""
+    record_skill_annotations: bool = False
+    """Whether the replayed trajectory should include state-aligned skill annotations."""
+    skill_annotation_cameras: Optional[list[str]] = None
+    """Optional sensor camera names used to store projected 2D skill annotation targets."""
     shader: Optional[str] = None
     """Change shader used for rendering for all cameras. Default is none meaning it will use whatever was used in the original data collection or the environment default.
     Can also be 'rt' for ray tracing and generating photo-realistic renders. Can also be 'rt-fast' for a faster but lower quality ray-traced renderer"""
@@ -429,7 +435,7 @@ def _main(
         env.unwrapped.control_mode,
         env.unwrapped.backend.sim_backend,
     )
-    new_traj_name = ori_traj_name + "." + suffix
+    new_traj_name = args.output_traj_name or (ori_traj_name + "." + suffix)
     if use_cpu_backend:
         if num_procs > 1:
             new_traj_name = new_traj_name + "." + str(proc_id)
@@ -530,6 +536,8 @@ def main(args: Args):
         save_trajectory=args.save_traj,
         save_video=args.save_video,
         record_reward=args.record_rewards,
+        record_skill_annotations=args.record_skill_annotations,
+        skill_annotation_cameras=args.skill_annotation_cameras,
     )
 
     if args.count is not None and args.count > len(json_data["episodes"]):
