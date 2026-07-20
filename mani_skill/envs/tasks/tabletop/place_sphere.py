@@ -17,6 +17,10 @@ from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
+from mani_skill.utils.skill_annotation.targets import (
+    build_panda_topdown_grasp_pose,
+    target_tcp_pose_from_object_goal,
+)
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
@@ -94,16 +98,35 @@ class PlaceSphereSkillFSM:
 
         pick = phase == int(PlaceSphereSkillPhase.PICK)
         place = phase == int(PlaceSphereSkillPhase.PLACE)
-        bin_target = place | (phase == int(PlaceSphereSkillPhase.DONE))
+        done = phase == int(PlaceSphereSkillPhase.DONE)
 
         skill_id = torch.full_like(phase, SKILL_IDS["none"])
         skill_id[pick] = SKILL_IDS["pick"]
         skill_id[place] = SKILL_IDS["place"]
 
-        obj_pos = self._select(env.obj.pose.p, env_idx).reshape(-1, 3)
+        obj_pose = Pose.create(self._select(env.obj.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        pick_target_pose = build_panda_topdown_grasp_pose(
+            center=obj_pose.p,
+            tcp_pose=tcp_pose,
+        )
+
         bin_top_pos = self._select(env.bin.pose.p, env_idx).reshape(-1, 3).clone()
         bin_top_pos[:, 2] = bin_top_pos[:, 2] + env.block_half_size[0] + env.radius
-        target_point_world = torch.where(bin_target[:, None], bin_top_pos, obj_pos)
+        desired_obj_pose = Pose.create_from_pq(p=bin_top_pos, q=obj_pose.q)
+        place_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=obj_pose,
+            desired_object_pose=desired_obj_pose,
+        )
+
+        target_pose_world = torch.where(
+            place[:, None, None],
+            place_target_pose.to_transformation_matrix(),
+            pick_target_pose.to_transformation_matrix(),
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
 
         phase_names_by_id = {
             int(PlaceSphereSkillPhase.PICK): "pick",
@@ -122,7 +145,7 @@ class PlaceSphereSkillFSM:
         }
         phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
         target_objects = [
-            "sphere" if x == int(PlaceSphereSkillPhase.PICK) else "bin"
+            None if x == int(PlaceSphereSkillPhase.DONE) else "tcp"
             for x in phase_ids
         ]
 
@@ -143,7 +166,7 @@ class PlaceSphereSkillFSM:
             phase=[phase_names_by_id[x] for x in phase_ids],
             skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
             target_point_world=target_point_world,
-            target_pose_world=None,
+            target_pose_world=target_pose_world,
             target_gripper_width=None,
             active_object=["sphere"] * len(phase_ids),
             target_object=target_objects,

@@ -6,6 +6,10 @@ from mani_skill.envs.tasks.tabletop.peg_insertion_side import (
     PegInsertionSideSkillFSM,
     PegInsertionSideSkillPhase,
 )
+from mani_skill.envs.tasks.tabletop.pick_cube import (
+    PickCubeSkillFSM,
+    PickCubeSkillPhase,
+)
 from mani_skill.envs.tasks.tabletop.place_sphere import (
     PlaceSphereSkillFSM,
     PlaceSphereSkillPhase,
@@ -33,6 +37,7 @@ from mani_skill.utils.skill_annotation import (
     reset_skill_annotator,
     skill_to_id,
 )
+from mani_skill.utils.structs.pose import Pose
 
 
 def test_skill_vocab_and_schema_normalization():
@@ -320,7 +325,7 @@ def test_poke_cube_skill_fsm_transitions_through_align_and_push():
     context = fsm.build_context(env)
     assert context.skill_id.tolist() == [SKILL_IDS["push"]]
     assert context.phase == ["align"]
-    assert context.target_object == ["cube"]
+    assert context.target_object == ["tcp"]
 
     env.set_info(is_peg_grasped=True, is_peg_cube_fit=False)
     fsm.update(env)
@@ -338,7 +343,7 @@ def test_poke_cube_skill_fsm_transitions_through_align_and_push():
     context = fsm.build_context(env)
     assert context.skill_id.tolist() == [SKILL_IDS["push"]]
     assert context.phase == ["push"]
-    assert context.target_object == ["goal_region"]
+    assert context.target_object == ["tcp"]
 
     env.set_info(is_peg_grasped=False, success=False)
     fsm.update(env)
@@ -370,7 +375,7 @@ def test_peg_insertion_side_skill_fsm_transitions_through_pre_insert():
     context = fsm.build_context(env)
     assert context.skill_id.tolist() == [SKILL_IDS["insert"]]
     assert context.phase == ["pre_insert"]
-    assert context.target_object == ["box_hole"]
+    assert context.target_object == ["tcp"]
 
     env.set_info(is_grasped=True, pre_inserted=False)
     fsm.update(env)
@@ -388,7 +393,7 @@ def test_peg_insertion_side_skill_fsm_transitions_through_pre_insert():
     context = fsm.build_context(env)
     assert context.skill_id.tolist() == [SKILL_IDS["insert"]]
     assert context.phase == ["insert"]
-    assert context.target_object == ["box_hole"]
+    assert context.target_object == ["tcp"]
 
     env.set_info(is_grasped=False, success=False)
     fsm.update(env)
@@ -407,15 +412,20 @@ def test_peg_insertion_side_skill_fsm_transitions_through_pre_insert():
     assert fsm.phase.tolist() == [int(PegInsertionSideSkillPhase.DONE)]
 
 
-def test_tabletop_skill_fsm_contexts_normalize_for_all_new_tasks():
+def test_tabletop_skill_fsm_contexts_normalize_for_all_tcp_target_tasks():
     cases = [
+        (
+            PickCubeSkillFSM,
+            _PickCubeFSMEnv(num_envs=2),
+            [PickCubeSkillPhase.PICK, PickCubeSkillPhase.PLACE],
+            [SKILL_IDS["pick"], SKILL_IDS["place"]],
+            "PickCube-v1",
+        ),
         (
             PlaceSphereSkillFSM,
             _PlaceSphereFSMEnv(num_envs=2),
             [PlaceSphereSkillPhase.PICK, PlaceSphereSkillPhase.PLACE],
             [SKILL_IDS["pick"], SKILL_IDS["place"]],
-            ["sphere", "bin"],
-            [False, False],
             "PlaceSphere-v1",
         ),
         (
@@ -423,8 +433,6 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_new_tasks():
             _StackCubeFSMEnv(num_envs=2),
             [StackCubeSkillPhase.PICK, StackCubeSkillPhase.PLACE],
             [SKILL_IDS["pick"], SKILL_IDS["place"]],
-            ["cubeA", "cubeB"],
-            [False, False],
             "StackCube-v1",
         ),
         (
@@ -432,8 +440,6 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_new_tasks():
             _PokeCubeFSMEnv(num_envs=2),
             [PokeCubeSkillPhase.PICK, PokeCubeSkillPhase.ALIGN],
             [SKILL_IDS["pick"], SKILL_IDS["push"]],
-            ["peg", "cube"],
-            [False, False],
             "PokeCube-v1",
         ),
         (
@@ -444,13 +450,11 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_new_tasks():
                 PegInsertionSideSkillPhase.PRE_INSERT,
             ],
             [SKILL_IDS["pick"], SKILL_IDS["insert"]],
-            ["peg", "box_hole"],
-            [False, True],
             "PegInsertionSide-v1",
         ),
     ]
 
-    for fsm_cls, env, phases, skill_ids, target_objects, pose_valid, task_name in cases:
+    for fsm_cls, env, phases, skill_ids, task_name in cases:
         fsm = fsm_cls(num_envs=2, device="cpu")
         fsm.phase.copy_(torch.tensor([int(x) for x in phases], dtype=torch.long))
 
@@ -462,15 +466,147 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_new_tasks():
         assert normalized.phase_id.tolist() == [0, 1]
         assert normalized.target_point_world.shape == (2, 3)
         assert normalized.target_point_valid.tolist() == [True, True]
-        assert normalized.target_pose_valid.tolist() == pose_valid
-        assert normalized.target_object == target_objects
+        assert normalized.target_pose_valid.tolist() == [True, True]
+        assert normalized.target_object == ["tcp", "tcp"]
+        assert torch.allclose(
+            normalized.target_point_world,
+            normalized.target_pose_world[:, :3, 3],
+        )
         assert normalized.task_meta["task"] == task_name
         assert normalized.task_meta["target_frame"] == "world"
+
+        selected = normalize_skill_context(
+            fsm.build_context(env, env_idx=[1]), num_envs=1, device="cpu"
+        )
+        assert selected.phase_id.tolist() == [1]
+        assert selected.target_object == ["tcp"]
+        assert torch.allclose(
+            selected.target_pose_world,
+            normalized.target_pose_world[1:2],
+        )
+        assert torch.allclose(
+            selected.target_point_world,
+            normalized.target_point_world[1:2],
+        )
+
+
+def test_tabletop_skill_fsm_tcp_target_geometry_for_every_active_phase():
+    cases = [
+        (
+            PickCubeSkillFSM,
+            _PickCubeFSMEnv(num_envs=2),
+            [PickCubeSkillPhase.PICK, PickCubeSkillPhase.PLACE],
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.3]],
+        ),
+        (
+            PlaceSphereSkillFSM,
+            _PlaceSphereFSMEnv(num_envs=2),
+            [PlaceSphereSkillPhase.PICK, PlaceSphereSkillPhase.PLACE],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.225]],
+        ),
+        (
+            StackCubeSkillFSM,
+            _StackCubeFSMEnv(num_envs=2),
+            [StackCubeSkillPhase.PICK, StackCubeSkillPhase.PLACE],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.26]],
+        ),
+        (
+            PokeCubeSkillFSM,
+            _PokeCubeFSMEnv(num_envs=3),
+            [
+                PokeCubeSkillPhase.PICK,
+                PokeCubeSkillPhase.ALIGN,
+                PokeCubeSkillPhase.PUSH,
+            ],
+            [[0.0, 0.0, 0.0], [-0.12, 0.0, 0.2], [0.0, 0.0, 0.2]],
+        ),
+        (
+            PegInsertionSideSkillFSM,
+            _PegInsertionSideFSMEnv(num_envs=3),
+            [
+                PegInsertionSideSkillPhase.PICK,
+                PegInsertionSideSkillPhase.PRE_INSERT,
+                PegInsertionSideSkillPhase.INSERT,
+            ],
+            [[-0.06, 0.0, 0.0], [-0.01, 0.0, 0.25], [0.15, 0.0, 0.25]],
+        ),
+    ]
+
+    for fsm_cls, env, phases, expected_points in cases:
+        fsm = fsm_cls(num_envs=len(phases), device="cpu")
+        fsm.phase.copy_(torch.tensor([int(x) for x in phases], dtype=torch.long))
+        normalized = normalize_skill_context(
+            fsm.build_context(env), num_envs=len(phases), device="cpu"
+        )
+
+        assert normalized.target_pose_valid.tolist() == [True] * len(phases)
+        assert normalized.target_point_valid.tolist() == [True] * len(phases)
+        assert normalized.target_object == ["tcp"] * len(phases)
+        assert torch.allclose(
+            normalized.target_point_world,
+            torch.tensor(expected_points, dtype=torch.float32),
+            atol=1e-5,
+        )
+        assert torch.allclose(
+            normalized.target_point_world,
+            normalized.target_pose_world[:, :3, 3],
+        )
+        assert torch.allclose(
+            normalized.target_pose_world[0, :3, 2],
+            torch.tensor([0.0, 0.0, -1.0]),
+            atol=1e-5,
+        )
+        assert torch.allclose(
+            normalized.target_pose_world[0, :3, 1],
+            torch.tensor([0.0, -1.0, 0.0]),
+            atol=1e-5,
+        )
+
+
+def test_tabletop_skill_fsm_done_has_no_tcp_target():
+    cases = [
+        (PickCubeSkillFSM, _PickCubeFSMEnv(num_envs=2), PickCubeSkillPhase.DONE),
+        (
+            PlaceSphereSkillFSM,
+            _PlaceSphereFSMEnv(num_envs=2),
+            PlaceSphereSkillPhase.DONE,
+        ),
+        (
+            StackCubeSkillFSM,
+            _StackCubeFSMEnv(num_envs=2),
+            StackCubeSkillPhase.DONE,
+        ),
+        (PokeCubeSkillFSM, _PokeCubeFSMEnv(num_envs=2), PokeCubeSkillPhase.DONE),
+        (
+            PegInsertionSideSkillFSM,
+            _PegInsertionSideFSMEnv(num_envs=2),
+            PegInsertionSideSkillPhase.DONE,
+        ),
+    ]
+
+    for fsm_cls, env, done_phase in cases:
+        fsm = fsm_cls(num_envs=2, device="cpu")
+        fsm.phase.fill_(int(done_phase))
+        context = fsm.build_context(env)
+
+        assert torch.isnan(context.target_pose_world).all()
+        assert torch.isnan(context.target_point_world).all()
+        assert context.target_object == [None, None]
+
+        normalized = normalize_skill_context(context, num_envs=2, device="cpu")
+        assert normalized.target_pose_valid.tolist() == [False, False]
+        assert normalized.target_point_valid.tolist() == [False, False]
 
 
 @pytest.mark.parametrize(
     "env_id",
-    ["PlaceSphere-v1", "StackCube-v1", "PokeCube-v1", "PegInsertionSide-v1"],
+    [
+        "PickCube-v1",
+        "PlaceSphere-v1",
+        "StackCube-v1",
+        "PokeCube-v1",
+        "PegInsertionSide-v1",
+    ],
 )
 def test_tabletop_skill_annotation_context_smoke_after_reset(env_id):
     import gymnasium as gym
@@ -494,6 +630,12 @@ def test_tabletop_skill_annotation_context_smoke_after_reset(env_id):
         assert normalized.phase_id.tolist() == [0]
         assert normalized.target_point_world.shape == (1, 3)
         assert normalized.target_point_valid.tolist() == [True]
+        assert normalized.target_pose_valid.tolist() == [True]
+        assert normalized.target_object == ["tcp"]
+        assert torch.allclose(
+            normalized.target_point_world,
+            normalized.target_pose_world[:, :3, 3],
+        )
         assert normalized.task_meta["task"] == env_id
     finally:
         env.close()
@@ -648,31 +790,76 @@ def _bool_tensor(value, num_envs):
 
 
 class _PoseStub:
-    def __init__(self, p):
-        self.p = torch.as_tensor(p, dtype=torch.float32)
-        if self.p.ndim == 1:
-            self.p = self.p[None, :]
+    def __init__(self, p, q=None):
+        self._pose = Pose.create_from_pq(
+            p=torch.as_tensor(p, dtype=torch.float32),
+            q=None if q is None else torch.as_tensor(q, dtype=torch.float32),
+        )
+
+    @property
+    def p(self):
+        return self._pose.p
+
+    @property
+    def q(self):
+        return self._pose.q
+
+    @property
+    def raw_pose(self):
+        return self._pose.raw_pose
 
     def to_transformation_matrix(self):
-        pose = torch.eye(4, dtype=torch.float32)[None].repeat(len(self.p), 1, 1)
-        pose[:, :3, 3] = self.p
-        return pose
+        return self._pose.to_transformation_matrix()
 
 
 class _ActorStub:
-    def __init__(self, p):
-        self.pose = _PoseStub(p)
+    def __init__(self, p, q=None):
+        self.pose = _PoseStub(p, q)
 
 
 class _GraspingAgentStub:
-    def __init__(self, num_envs):
+    def __init__(self, num_envs, tcp_p=None, tcp_q=None):
         self.num_envs = num_envs
         self.is_grasped = torch.zeros(num_envs, dtype=torch.bool)
         self.max_angle_calls = []
+        if tcp_p is None:
+            tcp_p = torch.tensor([[-0.1, 0.0, 0.2]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        if tcp_q is None:
+            tcp_q = torch.tensor([[0.0, 1.0, 0.0, 0.0]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        self.tcp = _ActorStub(tcp_p, tcp_q)
 
     def is_grasping(self, actor, max_angle=None):
         self.max_angle_calls.append(max_angle)
         return self.is_grasped
+
+
+class _PickCubeFSMEnv:
+    device = "cpu"
+
+    def __init__(self, num_envs=1):
+        self.num_envs = num_envs
+        self.cube = _ActorStub(torch.zeros((num_envs, 3)))
+        self.goal_site = _ActorStub(
+            torch.tensor([[0.2, 0.0, 0.1]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.agent = _GraspingAgentStub(num_envs)
+        self.set_info()
+
+    def set_info(self, is_grasped=False, is_obj_placed=False, success=False):
+        self._info = {
+            "is_grasped": _bool_tensor(is_grasped, self.num_envs),
+            "is_obj_placed": _bool_tensor(is_obj_placed, self.num_envs),
+            "success": _bool_tensor(success, self.num_envs),
+        }
+
+    def evaluate(self):
+        return {key: value.clone() for key, value in self._info.items()}
 
 
 class _PlaceSphereFSMEnv:
@@ -688,6 +875,7 @@ class _PlaceSphereFSMEnv:
                 num_envs, 1
             )
         )
+        self.agent = _GraspingAgentStub(num_envs)
         self.set_info()
 
     def set_info(
@@ -718,6 +906,7 @@ class _StackCubeFSMEnv:
         self.cubeB = _ActorStub(
             torch.tensor([[0.1, 0.0, 0.02]], dtype=torch.float32).repeat(num_envs, 1)
         )
+        self.agent = _GraspingAgentStub(num_envs)
         self.set_info()
 
     def set_info(
@@ -745,6 +934,11 @@ class _PokeCubeFSMEnv:
     def __init__(self, num_envs=1):
         self.num_envs = num_envs
         self.peg = _ActorStub(torch.zeros((num_envs, 3)))
+        self.peg_head_offsets = _PoseStub(
+            torch.tensor([[0.12, 0.0, 0.0]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
         self.cube = _ActorStub(
             torch.tensor([[0.1, 0.0, self.cube_half_size]], dtype=torch.float32).repeat(
                 num_envs, 1
@@ -755,6 +949,7 @@ class _PokeCubeFSMEnv:
                 num_envs, 1
             )
         )
+        self.agent = _GraspingAgentStub(num_envs)
         self.set_info()
 
     def set_info(
@@ -790,6 +985,9 @@ class _PegInsertionSideFSMEnv:
     def __init__(self, num_envs=1):
         self.num_envs = num_envs
         self.peg = _ActorStub(torch.zeros((num_envs, 3)))
+        self.peg_half_sizes = torch.tensor(
+            [[0.1, 0.02, 0.02]], dtype=torch.float32
+        ).repeat(num_envs, 1)
         self.goal_pose = _PoseStub(
             torch.tensor([[0.2, 0.0, 0.05]], dtype=torch.float32).repeat(
                 num_envs, 1

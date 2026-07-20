@@ -15,6 +15,10 @@ from mani_skill.utils.building import actors
 from mani_skill.utils.geometry import rotation_conversions
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
+from mani_skill.utils.skill_annotation.targets import (
+    build_panda_topdown_grasp_pose,
+    target_tcp_pose_from_object_goal,
+)
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
 
@@ -96,22 +100,63 @@ class PokeCubeSkillFSM:
         pick = phase == int(PokeCubeSkillPhase.PICK)
         align = phase == int(PokeCubeSkillPhase.ALIGN)
         push = phase == int(PokeCubeSkillPhase.PUSH)
-        goal_target = push | (phase == int(PokeCubeSkillPhase.DONE))
+        done = phase == int(PokeCubeSkillPhase.DONE)
 
         skill_id = torch.full_like(phase, SKILL_IDS["none"])
         skill_id[pick] = SKILL_IDS["pick"]
         skill_id[align] = SKILL_IDS["push"]
         skill_id[push] = SKILL_IDS["push"]
 
-        peg_pos = self._select(env.peg.pose.p, env_idx).reshape(-1, 3)
-        cube_pos = self._select(env.cube.pose.p, env_idx).reshape(-1, 3)
-        goal_pos = self._select(env.goal_region.pose.p, env_idx).reshape(-1, 3).clone()
-        goal_pos[:, 2] = env.cube_half_size
-        target_point_world = torch.where(
-            goal_target[:, None],
-            goal_pos,
-            torch.where(align[:, None], cube_pos, peg_pos),
+        peg_pose = Pose.create(self._select(env.peg.pose.raw_pose, env_idx))
+        cube_pose = Pose.create(self._select(env.cube.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        peg_head_offset = Pose.create(
+            self._select(env.peg_head_offsets.raw_pose, env_idx)
         )
+
+        pick_target_pose = build_panda_topdown_grasp_pose(
+            center=peg_pose.p,
+            tcp_pose=tcp_pose,
+            object_pose=peg_pose,
+        )
+
+        peg_head_pose = peg_pose * peg_head_offset
+        desired_peg_head_pos = peg_head_pose.p.clone()
+        desired_peg_head_pos[:, :2] = cube_pose.p[:, :2]
+        desired_peg_head_pose = Pose.create_from_pq(
+            p=desired_peg_head_pos,
+            q=cube_pose.q,
+        )
+        desired_peg_pose = desired_peg_head_pose * peg_head_offset.inv()
+        align_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=peg_pose,
+            desired_object_pose=desired_peg_pose,
+        )
+
+        desired_cube_pos = cube_pose.p.clone()
+        goal_pos = self._select(env.goal_region.pose.p, env_idx).reshape(-1, 3)
+        desired_cube_pos[:, :2] = goal_pos[:, :2]
+        desired_cube_pose = Pose.create_from_pq(p=desired_cube_pos, q=cube_pose.q)
+        push_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=cube_pose,
+            desired_object_pose=desired_cube_pose,
+        )
+
+        target_pose_world = pick_target_pose.to_transformation_matrix()
+        target_pose_world = torch.where(
+            align[:, None, None],
+            align_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world = torch.where(
+            push[:, None, None],
+            push_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
 
         phase_names_by_id = {
             int(PokeCubeSkillPhase.PICK): "pick",
@@ -132,13 +177,9 @@ class PokeCubeSkillFSM:
             int(PokeCubeSkillPhase.DONE): "task_done",
         }
         phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
-        target_objects_by_phase_id = {
-            int(PokeCubeSkillPhase.PICK): "peg",
-            int(PokeCubeSkillPhase.ALIGN): "cube",
-            int(PokeCubeSkillPhase.PUSH): "goal_region",
-            int(PokeCubeSkillPhase.DONE): "goal_region",
-        }
-        target_objects = [target_objects_by_phase_id[x] for x in phase_ids]
+        target_objects = [
+            None if x == int(PokeCubeSkillPhase.DONE) else "tcp" for x in phase_ids
+        ]
 
         info = env.evaluate()
         task_meta = {
@@ -159,7 +200,7 @@ class PokeCubeSkillFSM:
             phase=[phase_names_by_id[x] for x in phase_ids],
             skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
             target_point_world=target_point_world,
-            target_pose_world=None,
+            target_pose_world=target_pose_world,
             target_gripper_width=None,
             active_object=["peg"] * len(phase_ids),
             target_object=target_objects,

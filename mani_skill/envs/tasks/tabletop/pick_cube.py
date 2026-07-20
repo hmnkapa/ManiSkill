@@ -14,6 +14,10 @@ from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
+from mani_skill.utils.skill_annotation.targets import (
+    build_panda_topdown_grasp_pose,
+    target_tcp_pose_from_object_goal,
+)
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
 
@@ -100,15 +104,35 @@ class PickCubeSkillFSM:
 
         pick = phase == int(PickCubeSkillPhase.PICK)
         place = phase == int(PickCubeSkillPhase.PLACE)
-        goal_target = place | (phase == int(PickCubeSkillPhase.DONE))
+        done = phase == int(PickCubeSkillPhase.DONE)
 
         skill_id = torch.full_like(phase, SKILL_IDS["none"])
         skill_id[pick] = SKILL_IDS["pick"]
         skill_id[place] = SKILL_IDS["place"]
 
-        cube_pos = self._select(env.cube.pose.p, env_idx).reshape(-1, 3)
+        cube_pose = Pose.create(self._select(env.cube.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        pick_target_pose = build_panda_topdown_grasp_pose(
+            center=cube_pose.p,
+            tcp_pose=tcp_pose,
+            object_pose=cube_pose,
+        )
+
         goal_pos = self._select(env.goal_site.pose.p, env_idx).reshape(-1, 3)
-        target_point_world = torch.where(goal_target[:, None], goal_pos, cube_pos)
+        desired_cube_pose = Pose.create_from_pq(p=goal_pos, q=cube_pose.q)
+        place_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=cube_pose,
+            desired_object_pose=desired_cube_pose,
+        )
+
+        target_pose_world = torch.where(
+            place[:, None, None],
+            place_target_pose.to_transformation_matrix(),
+            pick_target_pose.to_transformation_matrix(),
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
 
         phase_names_by_id = {
             int(PickCubeSkillPhase.PICK): "pick",
@@ -127,8 +151,7 @@ class PickCubeSkillFSM:
         }
         phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
         target_objects = [
-            "cube" if x == int(PickCubeSkillPhase.PICK) else "goal_site"
-            for x in phase_ids
+            None if x == int(PickCubeSkillPhase.DONE) else "tcp" for x in phase_ids
         ]
 
         info = env.evaluate()
@@ -147,7 +170,7 @@ class PickCubeSkillFSM:
             phase=[phase_names_by_id[x] for x in phase_ids],
             skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
             target_point_world=target_point_world,
-            target_pose_world=None,
+            target_pose_world=target_pose_world,
             target_gripper_width=None,
             active_object=["cube"] * len(phase_ids),
             target_object=target_objects,

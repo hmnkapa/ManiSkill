@@ -13,6 +13,7 @@ from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
+from mani_skill.utils.skill_annotation.targets import build_panda_topdown_grasp_pose
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs import Actor, Pose
 from mani_skill.utils.structs.types import SimConfig
@@ -128,23 +129,52 @@ class PegInsertionSideSkillFSM:
         pick = phase == int(PegInsertionSideSkillPhase.PICK)
         pre_insert = phase == int(PegInsertionSideSkillPhase.PRE_INSERT)
         insert = phase == int(PegInsertionSideSkillPhase.INSERT)
-        insert_target = ~pick
+        done = phase == int(PegInsertionSideSkillPhase.DONE)
 
         skill_id = torch.full_like(phase, SKILL_IDS["none"])
         skill_id[pick] = SKILL_IDS["pick"]
         skill_id[pre_insert] = SKILL_IDS["insert"]
         skill_id[insert] = SKILL_IDS["insert"]
 
-        peg_pos = self._select(env.peg.pose.p, env_idx).reshape(-1, 3)
-        goal_pose = env.goal_pose
-        goal_pos = self._select(goal_pose.p, env_idx).reshape(-1, 3)
-        target_point_world = torch.where(insert_target[:, None], goal_pos, peg_pos)
+        peg_pose = Pose.create(self._select(env.peg.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        goal_pose = Pose.create(self._select(env.goal_pose.raw_pose, env_idx))
 
-        target_pose_world = self._select(
-            goal_pose.to_transformation_matrix(), env_idx
-        ).reshape(-1, 4, 4)
-        target_pose_world = target_pose_world.clone()
-        target_pose_world[pick] = float("nan")
+        pick_offset_pos = torch.zeros_like(peg_pose.p)
+        pick_offset_pos[:, 0] = -0.06
+        pick_center = (peg_pose * Pose.create_from_pq(p=pick_offset_pos)).p
+        pick_target_pose = build_panda_topdown_grasp_pose(
+            center=pick_center,
+            tcp_pose=tcp_pose,
+            object_pose=peg_pose,
+        )
+
+        base_insert_target_pose = goal_pose * peg_pose.inv() * tcp_pose
+        peg_half_length = self._select(env.peg_half_sizes[:, 0], env_idx).reshape(-1)
+        pre_insert_offset_pos = torch.zeros_like(peg_pose.p)
+        pre_insert_offset_pos[:, 0] = -0.01 - peg_half_length
+        pre_insert_target_pose = base_insert_target_pose * Pose.create_from_pq(
+            p=pre_insert_offset_pos
+        )
+        insert_offset_pos = torch.zeros_like(peg_pose.p)
+        insert_offset_pos[:, 0] = 0.05
+        insert_target_pose = base_insert_target_pose * Pose.create_from_pq(
+            p=insert_offset_pos
+        )
+
+        target_pose_world = pick_target_pose.to_transformation_matrix()
+        target_pose_world = torch.where(
+            pre_insert[:, None, None],
+            pre_insert_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world = torch.where(
+            insert[:, None, None],
+            insert_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
 
         phase_names_by_id = {
             int(PegInsertionSideSkillPhase.PICK): "pick",
@@ -166,7 +196,7 @@ class PegInsertionSideSkillFSM:
         }
         phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
         target_objects = [
-            "peg" if x == int(PegInsertionSideSkillPhase.PICK) else "box_hole"
+            None if x == int(PegInsertionSideSkillPhase.DONE) else "tcp"
             for x in phase_ids
         ]
 
