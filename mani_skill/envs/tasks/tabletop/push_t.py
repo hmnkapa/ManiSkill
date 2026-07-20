@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,7 @@ from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
 from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 
@@ -48,18 +50,262 @@ class WhiteTableSceneBuilder(TableSceneBuilder):
         super().build()
         # cheap way to un-texture table
         for part in self.table._objs:
-            for triangle in (
-                part.find_component_by_type(sapien.render.RenderBodyComponent)
-                .render_shapes[0]
-                .parts
-            ):
-                triangle.material.set_base_color(np.array([255, 255, 255, 255]) / 255)
-                triangle.material.set_base_color_texture(None)
-                triangle.material.set_normal_texture(None)
-                triangle.material.set_emission_texture(None)
-                triangle.material.set_transmission_texture(None)
-                triangle.material.set_metallic_texture(None)
-                triangle.material.set_roughness_texture(None)
+            render_body = part.find_component_by_type(sapien.render.RenderBodyComponent)
+            if render_body is None:
+                continue
+            for render_shape in render_body.render_shapes:
+                for triangle in render_shape.parts:
+                    triangle.material.set_base_color(
+                        np.array([255, 255, 255, 255]) / 255
+                    )
+                    triangle.material.set_base_color_texture(None)
+                    triangle.material.set_normal_texture(None)
+                    triangle.material.set_emission_texture(None)
+                    triangle.material.set_transmission_texture(None)
+                    triangle.material.set_metallic_texture(None)
+                    triangle.material.set_roughness_texture(None)
+
+
+class PushTSkillPhase(IntEnum):
+    PUSH_ORIENT = 0
+    PUSH_PLACE = 1
+    DONE = 2
+
+
+class PushTSkillFSM:
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(PushTSkillPhase.PUSH_ORIENT),
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _normalize_env_idx(self, env_idx=None):
+        if env_idx is None:
+            return None
+        if torch.is_tensor(env_idx):
+            return env_idx.to(device=self.phase.device, dtype=torch.long).flatten()
+        return torch.as_tensor(
+            env_idx, device=self.phase.device, dtype=torch.long
+        ).flatten()
+
+    def _select(self, tensor: torch.Tensor, env_idx=None) -> torch.Tensor:
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            return tensor
+        return tensor[env_idx]
+
+    def _wrap_to_pi(self, angle: torch.Tensor) -> torch.Tensor:
+        return torch.remainder(angle + torch.pi, 2 * torch.pi) - torch.pi
+
+    def _rotate_xy(self, xy: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        if xy.ndim == 3:
+            cos_yaw = cos_yaw[:, None]
+            sin_yaw = sin_yaw[:, None]
+        return torch.stack(
+            [
+                xy[..., 0] * cos_yaw - xy[..., 1] * sin_yaw,
+                xy[..., 0] * sin_yaw + xy[..., 1] * cos_yaw,
+            ],
+            dim=-1,
+        )
+
+    def _compute_push_direction(self, tee_pos: torch.Tensor, goal_pos: torch.Tensor):
+        direction_xy = goal_pos[:, :2] - tee_pos[:, :2]
+        return direction_xy / torch.linalg.norm(
+            direction_xy, dim=1, keepdim=True
+        ).clamp_min(1e-6)
+
+    def _compute_support_radius(
+        self, direction_xy: torch.Tensor, goal_yaw: torch.Tensor
+    ) -> torch.Tensor:
+        footprint_vertices = torch.as_tensor(
+            [
+                [-0.1000, -0.0125],
+                [0.1000, -0.0125],
+                [-0.1000, -0.0625],
+                [0.1000, -0.0625],
+                [-0.0250, 0.1375],
+                [0.0250, 0.1375],
+                [-0.0250, -0.0125],
+                [0.0250, -0.0125],
+            ],
+            dtype=direction_xy.dtype,
+            device=direction_xy.device,
+        )
+        rotated_vertices = self._rotate_xy(
+            footprint_vertices[None].expand(direction_xy.shape[0], -1, -1), goal_yaw
+        )
+        return torch.max(
+            torch.sum(rotated_vertices * (-direction_xy[:, None, :]), dim=-1),
+            dim=1,
+        ).values.clamp_min(0.0)
+
+    def _compute_signals(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        info = env.evaluate()
+        intersection = env.pseudo_render_intersection()
+        tee_pos = env.tee.pose.p
+        goal_pos = env.goal_tee.pose.p
+        tee_yaw = env.quat_to_z_euler(env.tee.pose.q)
+        goal_yaw = env.quat_to_z_euler(env.goal_tee.pose.q)
+        yaw_delta = self._wrap_to_pi(tee_yaw - goal_yaw)
+        yaw_error = torch.abs(yaw_delta)
+        orientation_aligned = yaw_error < 0.15
+        rotation_contact_side = [
+            "right" if item > 0 else "left"
+            for item in yaw_delta.detach().cpu().tolist()
+        ]
+        signals = {
+            "success": info["success"],
+            "intersection": intersection,
+            "tee_to_goal_dist": torch.linalg.norm(
+                tee_pos[:, :2] - goal_pos[:, :2], dim=1
+            ),
+            "yaw_error": yaw_error,
+            "yaw_delta": yaw_delta,
+            "orientation_aligned": orientation_aligned,
+            "rotation_contact_side": rotation_contact_side,
+            "object_goal_pose_world": env.goal_tee.pose.to_transformation_matrix(),
+        }
+        if env_idx is None:
+            return signals
+        index_list = [int(i) for i in env_idx.detach().cpu().tolist()]
+        return {
+            key: value[env_idx]
+            if torch.is_tensor(value)
+            else [value[i] for i in index_list]
+            if isinstance(value, list)
+            else value
+            for key, value in signals.items()
+        }
+
+    def reset(self, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            self.phase.fill_(int(PushTSkillPhase.PUSH_ORIENT))
+        else:
+            self.phase[env_idx] = int(PushTSkillPhase.PUSH_ORIENT)
+
+    def update(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        signals = self._compute_signals(env, env_idx)
+        orientation_aligned = signals["orientation_aligned"]
+        success = signals["success"]
+
+        if env_idx is None:
+            phase = self.phase.clone()
+        else:
+            phase = self.phase[env_idx].clone()
+
+        push_orient = phase == int(PushTSkillPhase.PUSH_ORIENT)
+        push_place = phase == int(PushTSkillPhase.PUSH_PLACE)
+        phase[push_orient & orientation_aligned] = int(PushTSkillPhase.PUSH_PLACE)
+        phase[push_place & success] = int(PushTSkillPhase.DONE)
+
+        if env_idx is None:
+            self.phase.copy_(phase)
+        else:
+            self.phase[env_idx] = phase
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        env_idx = self._normalize_env_idx(env_idx)
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        push_orient = phase == int(PushTSkillPhase.PUSH_ORIENT)
+        push_place = phase == int(PushTSkillPhase.PUSH_PLACE)
+        done = phase == int(PushTSkillPhase.DONE)
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[push_orient] = SKILL_IDS["push"]
+        skill_id[push_place] = SKILL_IDS["push"]
+
+        tee_pos = self._select(env.tee.pose.p, env_idx).reshape(-1, 3)
+        goal_pos = self._select(env.goal_tee.pose.p, env_idx).reshape(-1, 3)
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        goal_yaw = self._select(env.quat_to_z_euler(env.goal_tee.pose.q), env_idx)
+        signals = self._compute_signals(env, env_idx)
+
+        orient_contact_xy = torch.zeros((len(phase), 2), device=phase.device)
+        orient_contact_xy[:, 0] = torch.where(
+            signals["yaw_delta"] > 0,
+            torch.full_like(signals["yaw_delta"], 0.10),
+            torch.full_like(signals["yaw_delta"], -0.10),
+        )
+        orient_contact_xy[:, 1] = -0.0375
+        orient_target_pos = tee_pos.clone()
+        orient_target_pos[:, :2] = tee_pos[:, :2] + self._rotate_xy(
+            orient_contact_xy, goal_yaw
+        )
+
+        push_direction = self._compute_push_direction(tee_pos, goal_pos)
+        support_radius = self._compute_support_radius(push_direction, goal_yaw)
+        place_target_pos = tee_pos.clone()
+        place_target_pos[:, :2] = goal_pos[:, :2] - push_direction * (
+            support_radius[:, None] + 0.005
+        )
+
+        orient_target_pose = Pose.create_from_pq(p=orient_target_pos, q=tcp_pose.q)
+        place_target_pose = Pose.create_from_pq(p=place_target_pos, q=tcp_pose.q)
+
+        target_pose_world = torch.where(
+            push_place[:, None, None],
+            place_target_pose.to_transformation_matrix(),
+            orient_target_pose.to_transformation_matrix(),
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
+
+        phase_names_by_id = {
+            int(PushTSkillPhase.PUSH_ORIENT): "push_orient",
+            int(PushTSkillPhase.PUSH_PLACE): "push_place",
+            int(PushTSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(PushTSkillPhase.PUSH_ORIENT): "push",
+            int(PushTSkillPhase.PUSH_PLACE): "push",
+            int(PushTSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(PushTSkillPhase.PUSH_ORIENT): "rotate_tee_toward_goal_yaw",
+            int(PushTSkillPhase.PUSH_PLACE): "push_aligned_tee_into_goal",
+            int(PushTSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+        target_objects = [
+            None if x == int(PushTSkillPhase.DONE) else "tcp" for x in phase_ids
+        ]
+
+        task_meta = {
+            "task": "PushT-v1",
+            "target_frame": "world",
+            "target_entity": "tcp",
+            "success": signals["success"],
+            "intersection": signals["intersection"],
+            "tee_to_goal_dist": signals["tee_to_goal_dist"],
+            "yaw_error": signals["yaw_error"],
+            "orientation_aligned": signals["orientation_aligned"],
+            "rotation_contact_side": signals["rotation_contact_side"],
+            "object_goal_pose_world": signals["object_goal_pose_world"],
+        }
+
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=target_point_world,
+            target_pose_world=target_pose_world,
+            target_gripper_width=None,
+            active_object=["tee"] * len(phase_ids),
+            target_object=target_objects,
+            task_meta=task_meta,
+        )
 
 
 @register_env("PushT-v1", max_episode_steps=100)
@@ -479,6 +725,19 @@ class PushTEnv(BaseEnv):
                     q=euler2quat(0, np.pi / 2, 0),
                 )
             )
+            self._get_or_create_skill_annotation_fsm().reset(env_idx)
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, PushTSkillFSM):
+            fsm = PushTSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     def evaluate(self):
         # success is where the overlap is over intersection thresh and ee dist to start pos is less than it's own thresh

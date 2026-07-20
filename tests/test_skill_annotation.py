@@ -2,6 +2,10 @@ import numpy as np
 import pytest
 import torch
 
+from mani_skill.envs.tasks.tabletop.lift_peg_upright import (
+    LiftPegUprightSkillFSM,
+    LiftPegUprightSkillPhase,
+)
 from mani_skill.envs.tasks.tabletop.peg_insertion_side import (
     PegInsertionSideSkillFSM,
     PegInsertionSideSkillPhase,
@@ -26,10 +30,15 @@ from mani_skill.envs.tasks.tabletop.pull_cube_tool import (
     PullCubeToolSkillFSM,
     PullCubeToolSkillPhase,
 )
+from mani_skill.envs.tasks.tabletop.plug_charger import (
+    PlugChargerSkillFSM,
+    PlugChargerSkillPhase,
+)
 from mani_skill.envs.tasks.tabletop.push_cube import (
     PushCubeSkillFSM,
     PushCubeSkillPhase,
 )
+from mani_skill.envs.tasks.tabletop.push_t import PushTSkillFSM, PushTSkillPhase
 from mani_skill.envs.tasks.tabletop.roll_ball import (
     RollBallSkillFSM,
     RollBallSkillPhase,
@@ -37,6 +46,10 @@ from mani_skill.envs.tasks.tabletop.roll_ball import (
 from mani_skill.envs.tasks.tabletop.stack_cube import (
     StackCubeSkillFSM,
     StackCubeSkillPhase,
+)
+from mani_skill.envs.tasks.tabletop.stack_pyramid import (
+    StackPyramidSkillFSM,
+    StackPyramidSkillPhase,
 )
 from mani_skill.utils.skill_annotation import (
     SKILL_IDS,
@@ -547,6 +560,164 @@ def test_roll_ball_skill_fsm_transitions_through_roll_without_reached_status():
     assert fsm.phase.tolist() == [int(RollBallSkillPhase.DONE)]
 
 
+def test_lift_peg_upright_skill_fsm_transitions_to_done():
+    env = _LiftPegUprightFSMEnv()
+    fsm = LiftPegUprightSkillFSM(num_envs=1, device="cpu")
+
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.PICK)]
+
+    env.set_grasped(True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.PLACE)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["place"]]
+    assert context.phase == ["place"]
+    assert context.skill_state == ["place_peg_upright"]
+
+    env.set_grasped(False)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.PLACE)]
+
+    env.set_info(success=True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.DONE)]
+
+    env.set_info(success=False)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.DONE)]
+
+    env = _LiftPegUprightFSMEnv(num_envs=2)
+    fsm = LiftPegUprightSkillFSM(num_envs=2, device="cpu")
+    env.set_grasped([False, True])
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(LiftPegUprightSkillPhase.PICK),
+        int(LiftPegUprightSkillPhase.PLACE),
+    ]
+
+
+def test_plug_charger_skill_fsm_transitions_through_insert():
+    env = _PlugChargerFSMEnv()
+    fsm = PlugChargerSkillFSM(num_envs=1, device="cpu")
+
+    assert fsm.phase.tolist() == [int(PlugChargerSkillPhase.PICK)]
+
+    env.set_grasped(True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlugChargerSkillPhase.PRE_INSERT)]
+    assert env.agent.max_angle_calls[-1] == 20
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["insert"]]
+    assert context.phase == ["pre_insert"]
+    assert context.skill_state == ["align_charger_with_receptacle"]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlugChargerSkillPhase.PRE_INSERT)]
+
+    env.move_charger_to_pre_insert_pose()
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlugChargerSkillPhase.INSERT)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["insert"]]
+    assert context.phase == ["insert"]
+    assert context.skill_state == ["insert_charger"]
+
+    env.set_info(success=True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlugChargerSkillPhase.DONE)]
+
+    env.set_grasped(False)
+    env.set_info(success=False)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlugChargerSkillPhase.DONE)]
+
+    env = _PlugChargerFSMEnv(num_envs=2)
+    fsm = PlugChargerSkillFSM(num_envs=2, device="cpu")
+    env.set_grasped([False, True])
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PlugChargerSkillPhase.PICK),
+        int(PlugChargerSkillPhase.PRE_INSERT),
+    ]
+
+
+def test_push_t_skill_fsm_transitions_through_place():
+    env = _PushTFSMEnv()
+    fsm = PushTSkillFSM(num_envs=1, device="cpu")
+
+    assert fsm.phase.tolist() == [int(PushTSkillPhase.PUSH_ORIENT)]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PushTSkillPhase.PUSH_ORIENT)]
+
+    env.set_tee_yaw(0.0)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PushTSkillPhase.PUSH_PLACE)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["push"]]
+    assert context.phase == ["push_place"]
+    assert context.skill_state == ["push_aligned_tee_into_goal"]
+
+    env.set_intersection(0.90)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PushTSkillPhase.DONE)]
+
+    env.set_intersection(0.0)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PushTSkillPhase.DONE)]
+
+    env = _PushTFSMEnv(num_envs=2, tee_yaw=[0.2, 0.0])
+    fsm = PushTSkillFSM(num_envs=2, device="cpu")
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PushTSkillPhase.PUSH_ORIENT),
+        int(PushTSkillPhase.PUSH_PLACE),
+    ]
+
+
+def test_stack_pyramid_skill_fsm_transitions_through_top_place():
+    env = _StackPyramidFSMEnv()
+    fsm = StackPyramidSkillFSM(num_envs=1, device="cpu")
+
+    assert fsm.phase.tolist() == [int(StackPyramidSkillPhase.PUSH_BASE)]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(StackPyramidSkillPhase.PUSH_BASE)]
+
+    env.move_base_pair_ready()
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(StackPyramidSkillPhase.PICK_TOP)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["pick"]]
+    assert context.phase == ["pick_top"]
+    assert context.active_object == ["cubeC"]
+
+    env.set_cubeC_grasped(True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(StackPyramidSkillPhase.PLACE_TOP)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["place"]]
+    assert context.phase == ["place_top"]
+    assert context.skill_state == ["place_cubeC_on_base_pair"]
+
+    env.set_info(success=True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(StackPyramidSkillPhase.DONE)]
+
+    env.set_info(success=False)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(StackPyramidSkillPhase.DONE)]
+
+    env = _StackPyramidFSMEnv(num_envs=2)
+    fsm = StackPyramidSkillFSM(num_envs=2, device="cpu")
+    env.move_base_pair_ready()
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(StackPyramidSkillPhase.PUSH_BASE),
+        int(StackPyramidSkillPhase.PICK_TOP),
+    ]
+
+
 def test_tabletop_skill_fsm_contexts_normalize_for_all_tcp_target_tasks():
     cases = [
         (
@@ -571,6 +742,13 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_tcp_target_tasks():
             "StackCube-v1",
         ),
         (
+            LiftPegUprightSkillFSM,
+            _LiftPegUprightFSMEnv(num_envs=2),
+            [LiftPegUprightSkillPhase.PICK, LiftPegUprightSkillPhase.PLACE],
+            [SKILL_IDS["pick"], SKILL_IDS["place"]],
+            "LiftPegUpright-v1",
+        ),
+        (
             PokeCubeSkillFSM,
             _PokeCubeFSMEnv(num_envs=2),
             [PokeCubeSkillPhase.PICK, PokeCubeSkillPhase.ALIGN],
@@ -586,6 +764,13 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_tcp_target_tasks():
             ],
             [SKILL_IDS["pick"], SKILL_IDS["insert"]],
             "PegInsertionSide-v1",
+        ),
+        (
+            PlugChargerSkillFSM,
+            _PlugChargerFSMEnv(num_envs=2),
+            [PlugChargerSkillPhase.PICK, PlugChargerSkillPhase.PRE_INSERT],
+            [SKILL_IDS["pick"], SKILL_IDS["insert"]],
+            "PlugCharger-v1",
         ),
         (
             PullCubeToolSkillFSM,
@@ -614,6 +799,20 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_tcp_target_tasks():
             [RollBallSkillPhase.ALIGN, RollBallSkillPhase.ROLL],
             [SKILL_IDS["push"], SKILL_IDS["push"]],
             "RollBall-v1",
+        ),
+        (
+            PushTSkillFSM,
+            _PushTFSMEnv(num_envs=2),
+            [PushTSkillPhase.PUSH_ORIENT, PushTSkillPhase.PUSH_PLACE],
+            [SKILL_IDS["push"], SKILL_IDS["push"]],
+            "PushT-v1",
+        ),
+        (
+            StackPyramidSkillFSM,
+            _StackPyramidFSMEnv(num_envs=2),
+            [StackPyramidSkillPhase.PUSH_BASE, StackPyramidSkillPhase.PICK_TOP],
+            [SKILL_IDS["push"], SKILL_IDS["pick"]],
+            "StackPyramid-v1",
         ),
     ]
 
@@ -754,6 +953,121 @@ def test_tabletop_skill_fsm_tcp_target_geometry_for_every_active_phase():
         )
 
 
+def test_new_task_skill_fsm_tcp_target_geometry_and_task_meta():
+    cases = [
+        (
+            LiftPegUprightSkillFSM,
+            _LiftPegUprightFSMEnv(num_envs=2),
+            [LiftPegUprightSkillPhase.PICK, LiftPegUprightSkillPhase.PLACE],
+            [[0.1, 0.0, 0.0], [-0.1, 0.0, 0.2]],
+            "LiftPegUpright-v1",
+            {
+                "success",
+                "is_grasped",
+                "is_peg_upright",
+                "close_to_table",
+                "upright_axis_error",
+                "z_error",
+                "desired_peg_pose_world",
+            },
+        ),
+        (
+            PlugChargerSkillFSM,
+            _PlugChargerFSMEnv(num_envs=3),
+            [
+                PlugChargerSkillPhase.PICK,
+                PlugChargerSkillPhase.PRE_INSERT,
+                PlugChargerSkillPhase.INSERT,
+            ],
+            [[-0.02, 0.0, 0.0], [0.05, 0.0, 0.45], [0.10, 0.0, 0.45]],
+            "PlugCharger-v1",
+            {
+                "success",
+                "is_grasped",
+                "obj_to_goal_dist",
+                "obj_to_goal_angle",
+                "pre_inserted",
+                "pre_x_error",
+                "pre_yz_error",
+                "pre_angle_error",
+                "charger_base_pose_world",
+                "object_goal_pose_world",
+            },
+        ),
+        (
+            PushTSkillFSM,
+            _PushTFSMEnv(num_envs=2, tee_yaw=[0.2, 0.0]),
+            [PushTSkillPhase.PUSH_ORIENT, PushTSkillPhase.PUSH_PLACE],
+            [[0.1, -0.0375, 0.02], [0.095, 0.0, 0.02]],
+            "PushT-v1",
+            {
+                "success",
+                "intersection",
+                "tee_to_goal_dist",
+                "yaw_error",
+                "orientation_aligned",
+                "rotation_contact_side",
+                "object_goal_pose_world",
+            },
+        ),
+        (
+            StackPyramidSkillFSM,
+            _StackPyramidFSMEnv(num_envs=3),
+            [
+                StackPyramidSkillPhase.PUSH_BASE,
+                StackPyramidSkillPhase.PICK_TOP,
+                StackPyramidSkillPhase.PLACE_TOP,
+            ],
+            [[0.035, 0.0, 0.02], [0.0, 0.0, 0.02], [-0.05, 0.0, 0.24]],
+            "StackPyramid-v1",
+            {
+                "success",
+                "base_pair_ready",
+                "is_cubeC_grasped",
+                "is_C_on_A",
+                "is_C_on_B",
+                "is_C_static",
+                "cubeC_goal_point_world",
+            },
+        ),
+    ]
+
+    for fsm_cls, env, phases, expected_points, task_name, meta_keys in cases:
+        fsm = fsm_cls(num_envs=len(phases), device="cpu")
+        fsm.phase.copy_(torch.tensor([int(x) for x in phases], dtype=torch.long))
+
+        context = fsm.build_context(env)
+        normalized = normalize_skill_context(
+            context, num_envs=len(phases), device="cpu"
+        )
+
+        assert normalized.target_pose_valid.tolist() == [True] * len(phases)
+        assert normalized.target_point_valid.tolist() == [True] * len(phases)
+        assert normalized.target_object == ["tcp"] * len(phases)
+        assert torch.allclose(
+            normalized.target_point_world,
+            torch.tensor(expected_points, dtype=torch.float32),
+            atol=1e-5,
+        )
+        assert torch.allclose(
+            normalized.target_point_world,
+            normalized.target_pose_world[:, :3, 3],
+        )
+        assert context.task_meta["task"] == task_name
+        assert context.task_meta["target_frame"] == "world"
+        assert context.task_meta["target_entity"] == "tcp"
+        assert meta_keys.issubset(context.task_meta.keys())
+
+        selected_context = fsm.build_context(env, env_idx=torch.tensor([1]))
+        assert selected_context.phase_id.tolist() == [1]
+        for key in meta_keys:
+            value = selected_context.task_meta[key]
+            if torch.is_tensor(value):
+                assert value.shape[0] == 1
+            elif isinstance(value, list):
+                assert len(value) == 1
+
+
 def test_tabletop_skill_fsm_done_has_no_tcp_target():
     cases = [
         (PickCubeSkillFSM, _PickCubeFSMEnv(num_envs=2), PickCubeSkillPhase.DONE),
@@ -767,11 +1081,21 @@ def test_tabletop_skill_fsm_done_has_no_tcp_target():
             _StackCubeFSMEnv(num_envs=2),
             StackCubeSkillPhase.DONE,
         ),
+        (
+            LiftPegUprightSkillFSM,
+            _LiftPegUprightFSMEnv(num_envs=2),
+            LiftPegUprightSkillPhase.DONE,
+        ),
         (PokeCubeSkillFSM, _PokeCubeFSMEnv(num_envs=2), PokeCubeSkillPhase.DONE),
         (
             PegInsertionSideSkillFSM,
             _PegInsertionSideFSMEnv(num_envs=2),
             PegInsertionSideSkillPhase.DONE,
+        ),
+        (
+            PlugChargerSkillFSM,
+            _PlugChargerFSMEnv(num_envs=2),
+            PlugChargerSkillPhase.DONE,
         ),
         (
             PullCubeToolSkillFSM,
@@ -781,6 +1105,12 @@ def test_tabletop_skill_fsm_done_has_no_tcp_target():
         (PushCubeSkillFSM, _PushCubeFSMEnv(num_envs=2), PushCubeSkillPhase.DONE),
         (PullCubeSkillFSM, _PullCubeFSMEnv(num_envs=2), PullCubeSkillPhase.DONE),
         (RollBallSkillFSM, _RollBallFSMEnv(num_envs=2), RollBallSkillPhase.DONE),
+        (PushTSkillFSM, _PushTFSMEnv(num_envs=2), PushTSkillPhase.DONE),
+        (
+            StackPyramidSkillFSM,
+            _StackPyramidFSMEnv(num_envs=2),
+            StackPyramidSkillPhase.DONE,
+        ),
     ]
 
     for fsm_cls, env, done_phase in cases:
@@ -893,18 +1223,85 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
                 assert value.shape[0] == 1
 
 
+def test_requested_task_skill_fsm_gripper_width_semantics():
+    plug_env = _PlugChargerFSMEnv(num_envs=3)
+    plug_fsm = PlugChargerSkillFSM(num_envs=3, device="cpu")
+    plug_fsm.phase.copy_(
+        torch.tensor(
+            [
+                int(PlugChargerSkillPhase.PICK),
+                int(PlugChargerSkillPhase.PRE_INSERT),
+                int(PlugChargerSkillPhase.INSERT),
+            ],
+            dtype=torch.long,
+        )
+    )
+    plug_context = normalize_skill_context(
+        plug_fsm.build_context(plug_env), num_envs=3, device="cpu"
+    )
+    assert plug_context.target_gripper_width_valid.tolist() == [True, True, True]
+    assert torch.allclose(plug_context.target_gripper_width, torch.zeros(3))
+
+    lift_env = _LiftPegUprightFSMEnv(num_envs=2)
+    lift_fsm = LiftPegUprightSkillFSM(num_envs=2, device="cpu")
+    lift_fsm.phase.copy_(
+        torch.tensor(
+            [
+                int(LiftPegUprightSkillPhase.PICK),
+                int(LiftPegUprightSkillPhase.PLACE),
+            ],
+            dtype=torch.long,
+        )
+    )
+    lift_context = normalize_skill_context(
+        lift_fsm.build_context(lift_env), num_envs=2, device="cpu"
+    )
+    assert lift_context.target_gripper_width_valid.tolist() == [False, True]
+    assert lift_context.target_gripper_width.tolist() == [0.0, 0.0]
+
+    stack_env = _StackPyramidFSMEnv(num_envs=3)
+    stack_fsm = StackPyramidSkillFSM(num_envs=3, device="cpu")
+    stack_fsm.phase.copy_(
+        torch.tensor(
+            [
+                int(StackPyramidSkillPhase.PUSH_BASE),
+                int(StackPyramidSkillPhase.PICK_TOP),
+                int(StackPyramidSkillPhase.PLACE_TOP),
+            ],
+            dtype=torch.long,
+        )
+    )
+    stack_context = normalize_skill_context(
+        stack_fsm.build_context(stack_env), num_envs=3, device="cpu"
+    )
+    assert stack_context.target_gripper_width_valid.tolist() == [True, False, True]
+    assert torch.allclose(
+        stack_context.target_gripper_width,
+        torch.tensor([0.0, 0.0, 0.08], dtype=torch.float32),
+    )
+
+    push_t_context = PushTSkillFSM(num_envs=2, device="cpu").build_context(
+        _PushTFSMEnv(num_envs=2)
+    )
+    assert push_t_context.target_gripper_width is None
+
+
 @pytest.mark.parametrize(
     "env_id",
     [
         "PickCube-v1",
         "PlaceSphere-v1",
         "StackCube-v1",
+        "LiftPegUpright-v1",
         "PokeCube-v1",
         "PegInsertionSide-v1",
+        "PlugCharger-v1",
         "PullCubeTool-v1",
         "PushCube-v1",
         "PullCube-v1",
         "RollBall-v1",
+        "PushT-v1",
+        "StackPyramid-v1",
     ],
 )
 def test_tabletop_skill_annotation_context_smoke_after_reset(env_id):
@@ -1088,6 +1485,16 @@ def _bool_tensor(value, num_envs):
     return tensor
 
 
+def _yaw_quat(yaw, num_envs=None):
+    yaw = torch.as_tensor(yaw, dtype=torch.float32).reshape(-1)
+    if num_envs is not None and yaw.numel() == 1:
+        yaw = yaw.repeat(num_envs)
+    q = torch.zeros((yaw.shape[0], 4), dtype=torch.float32)
+    q[:, 0] = torch.cos(yaw / 2)
+    q[:, 3] = torch.sin(yaw / 2)
+    return q
+
+
 class _PoseStub:
     def __init__(self, p, q=None):
         self._pose = Pose.create_from_pq(
@@ -1107,12 +1514,29 @@ class _PoseStub:
     def raw_pose(self):
         return self._pose.raw_pose
 
+    @property
+    def device(self):
+        return self._pose.device
+
+    def __mul__(self, other):
+        return self._pose * other
+
+    def inv(self):
+        return self._pose.inv()
+
     def to_transformation_matrix(self):
         return self._pose.to_transformation_matrix()
 
 
 class _ActorStub:
-    def __init__(self, p, q=None):
+    def __init__(self, p, q=None, static=True):
+        self.pose = _PoseStub(p, q)
+        self.static = _bool_tensor(static, self.pose.p.shape[0])
+
+    def is_static(self, lin_thresh=1e-2, ang_thresh=1e-1):
+        return self.static.clone()
+
+    def set_pose(self, p, q=None):
         self.pose = _PoseStub(p, q)
 
 
@@ -1141,13 +1565,17 @@ class _GraspingAgentStub:
             )
         self.tcp = _ActorStub(tcp_p, tcp_q)
         self.robot = _RobotStub(num_envs, base_p=base_p)
+        self._actor_grasped = {}
 
     def is_grasping(self, actor, max_angle=None):
         self.max_angle_calls.append(max_angle)
-        return self.is_grasped
+        return self._actor_grasped.get(id(actor), self.is_grasped)
 
     def set_tcp_pos(self, tcp_p):
         self.tcp = _ActorStub(tcp_p, self.tcp.pose.q)
+
+    def set_actor_grasped(self, actor, is_grasped):
+        self._actor_grasped[id(actor)] = _bool_tensor(is_grasped, self.num_envs)
 
 
 class _PickCubeFSMEnv:
@@ -1240,6 +1668,72 @@ class _StackCubeFSMEnv:
         return {key: value.clone() for key, value in self._info.items()}
 
 
+class _LiftPegUprightFSMEnv:
+    device = "cpu"
+    peg_half_length = 0.12
+
+    def __init__(self, num_envs=1):
+        self.num_envs = num_envs
+        peg_pos = torch.zeros((num_envs, 3), dtype=torch.float32)
+        peg_q = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32).repeat(
+            num_envs, 1
+        )
+        if num_envs > 1:
+            peg_pos[1:, 2] = self.peg_half_length
+            peg_q[1:] = torch.tensor([0.5, 0.5, -0.5, 0.5], dtype=torch.float32)
+        self.peg = _ActorStub(peg_pos, peg_q)
+        self.agent = _GraspingAgentStub(num_envs)
+        self.set_info()
+
+    def set_info(self, success=False):
+        self._info = {"success": _bool_tensor(success, self.num_envs)}
+
+    def set_grasped(self, is_grasped):
+        self.agent.is_grasped = _bool_tensor(is_grasped, self.num_envs)
+
+    def evaluate(self):
+        return {key: value.clone() for key, value in self._info.items()}
+
+
+class _StackPyramidFSMEnv:
+    device = "cpu"
+
+    def __init__(self, num_envs=1):
+        self.num_envs = num_envs
+        self.cube_half_size = torch.tensor([0.02, 0.02, 0.02], dtype=torch.float32)
+        self.cubeA = _ActorStub(
+            torch.tensor([[0.0, 0.0, 0.02]], dtype=torch.float32).repeat(num_envs, 1)
+        )
+        self.cubeB = _ActorStub(
+            torch.tensor([[0.1, 0.0, 0.02]], dtype=torch.float32).repeat(num_envs, 1)
+        )
+        self.cubeC = _ActorStub(
+            torch.tensor([[0.0, 0.0, 0.02]], dtype=torch.float32).repeat(num_envs, 1)
+        )
+        self.agent = _GraspingAgentStub(num_envs)
+        self.agent.set_actor_grasped(self.cubeA, False)
+        self.agent.set_actor_grasped(self.cubeC, False)
+        self.set_info()
+
+    def set_info(self, success=False):
+        self._info = {"success": _bool_tensor(success, self.num_envs)}
+
+    def move_base_pair_ready(self):
+        self.cubeA.set_pose(
+            torch.tensor([[0.06, 0.0, 0.02]], dtype=torch.float32).repeat(
+                self.num_envs, 1
+            )
+        )
+        self.agent.set_actor_grasped(self.cubeA, False)
+        self.cubeA.static = torch.ones(self.num_envs, dtype=torch.bool)
+
+    def set_cubeC_grasped(self, is_grasped):
+        self.agent.set_actor_grasped(self.cubeC, is_grasped)
+
+    def evaluate(self):
+        return {key: value.clone() for key, value in self._info.items()}
+
+
 class _PokeCubeFSMEnv:
     device = "cpu"
     cube_half_size = 0.02
@@ -1325,6 +1819,54 @@ class _PegInsertionSideFSMEnv:
     def get_peg_pre_insertion_info(self):
         distance = torch.zeros(self.num_envs, dtype=torch.float32)
         return self.pre_inserted, distance, distance
+
+
+class _PlugChargerFSMEnv:
+    device = "cpu"
+    _base_size = [0.02, 0.015, 0.012]
+
+    def __init__(self, num_envs=1):
+        self.num_envs = num_envs
+        self.charger = _ActorStub(torch.zeros((num_envs, 3), dtype=torch.float32))
+        self.goal_pose = _PoseStub(
+            torch.tensor([[0.2, 0.0, 0.25]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.agent = _GraspingAgentStub(num_envs)
+        self.set_info()
+
+    @property
+    def charger_base_pose(self):
+        return self.charger.pose._pose * Pose.create_from_pq(
+            p=torch.tensor([-self._base_size[0], 0.0, 0.0], dtype=torch.float32)
+        )
+
+    def set_info(self, success=False, obj_to_goal_dist=0.1, obj_to_goal_angle=0.5):
+        self._info = {
+            "success": _bool_tensor(success, self.num_envs),
+            "obj_to_goal_dist": torch.as_tensor(
+                obj_to_goal_dist, dtype=torch.float32
+            ).reshape(-1),
+            "obj_to_goal_angle": torch.as_tensor(
+                obj_to_goal_angle, dtype=torch.float32
+            ).reshape(-1),
+        }
+        for key in ("obj_to_goal_dist", "obj_to_goal_angle"):
+            if self._info[key].numel() == 1:
+                self._info[key] = self._info[key].repeat(self.num_envs)
+
+    def set_grasped(self, is_grasped):
+        self.agent.is_grasped = _bool_tensor(is_grasped, self.num_envs)
+
+    def move_charger_to_pre_insert_pose(self):
+        pre_insert_pose = self.goal_pose._pose * Pose.create_from_pq(
+            p=torch.tensor([-0.05, 0.0, 0.0], dtype=torch.float32)
+        )
+        self.charger.set_pose(pre_insert_pose.p, pre_insert_pose.q)
+
+    def evaluate(self):
+        return {key: value.clone() for key, value in self._info.items()}
 
 
 class _PullCubeToolFSMEnv:
@@ -1473,6 +2015,46 @@ class _RollBallFSMEnv:
 
     def evaluate(self):
         return {key: value.clone() for key, value in self._info.items()}
+
+
+class _PushTFSMEnv:
+    device = "cpu"
+    intersection_thresh = 0.90
+
+    def __init__(self, num_envs=1, tee_yaw=0.2):
+        self.num_envs = num_envs
+        tee_pos = torch.tensor([[0.0, 0.0, 0.02]], dtype=torch.float32).repeat(
+            num_envs, 1
+        )
+        goal_pos = torch.tensor([[0.2, 0.0, 0.001]], dtype=torch.float32).repeat(
+            num_envs, 1
+        )
+        self.tee = _ActorStub(tee_pos, _yaw_quat(tee_yaw, num_envs=num_envs))
+        self.goal_tee = _ActorStub(goal_pos, _yaw_quat(0.0, num_envs=num_envs))
+        self.agent = _GraspingAgentStub(num_envs)
+        self.set_intersection(0.0)
+
+    def quat_to_z_euler(self, quats):
+        signs = torch.ones_like(quats[:, -1])
+        signs[quats[:, -1] < 0] = -1.0
+        qw = quats[:, 0] * signs
+        return 2 * qw.acos()
+
+    def set_tee_yaw(self, yaw):
+        self.tee.set_pose(self.tee.pose.p, _yaw_quat(yaw, num_envs=self.num_envs))
+
+    def set_intersection(self, intersection):
+        self.intersection = torch.as_tensor(intersection, dtype=torch.float32).reshape(
+            -1
+        )
+        if self.intersection.numel() == 1:
+            self.intersection = self.intersection.repeat(self.num_envs)
+
+    def pseudo_render_intersection(self):
+        return self.intersection.clone()
+
+    def evaluate(self):
+        return {"success": self.pseudo_render_intersection() >= self.intersection_thresh}
 
 
 class _ContextSequenceEnv:

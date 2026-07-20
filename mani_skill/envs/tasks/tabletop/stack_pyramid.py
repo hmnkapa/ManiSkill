@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Union
 
 import numpy as np
@@ -17,7 +18,260 @@ from mani_skill.utils.geometry.rotation_conversions import (
 from mani_skill.utils.logging_utils import logger
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
+from mani_skill.utils.skill_annotation.targets import (
+    build_panda_topdown_grasp_pose,
+    target_tcp_pose_from_object_goal,
+)
 from mani_skill.utils.structs.pose import Pose
+
+
+class StackPyramidSkillPhase(IntEnum):
+    PUSH_BASE = 0
+    PICK_TOP = 1
+    PLACE_TOP = 2
+    DONE = 3
+
+
+class StackPyramidSkillFSM:
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(StackPyramidSkillPhase.PUSH_BASE),
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _normalize_env_idx(self, env_idx=None):
+        if env_idx is None:
+            return None
+        if torch.is_tensor(env_idx):
+            return env_idx.to(device=self.phase.device, dtype=torch.long).flatten()
+        return torch.as_tensor(
+            env_idx, device=self.phase.device, dtype=torch.long
+        ).flatten()
+
+    def _select(self, tensor: torch.Tensor, env_idx=None) -> torch.Tensor:
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            return tensor
+        return tensor[env_idx]
+
+    def _cube_half_size(self, env, dtype=torch.float32) -> torch.Tensor:
+        return torch.as_tensor(env.cube_half_size, device=env.device, dtype=dtype)
+
+    def _compute_push_direction(
+        self, cubeA_pos: torch.Tensor, cubeB_pos: torch.Tensor
+    ) -> torch.Tensor:
+        direction_xy = cubeB_pos[:, :2] - cubeA_pos[:, :2]
+        return direction_xy / torch.linalg.norm(
+            direction_xy, dim=1, keepdim=True
+        ).clamp_min(1e-6)
+
+    def _compute_cubeC_goal_point(self, env) -> torch.Tensor:
+        half_size = self._cube_half_size(env, dtype=env.cubeA.pose.p.dtype)
+        top_offset = torch.zeros(3, device=env.device, dtype=half_size.dtype)
+        top_offset[2] = 2 * half_size[2]
+        return ((env.cubeA.pose.p + top_offset) + (env.cubeB.pose.p + top_offset)) / 2
+
+    def _compute_signals(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        info = env.evaluate()
+        cubeA_pos = env.cubeA.pose.p
+        cubeB_pos = env.cubeB.pose.p
+        cubeC_pos = env.cubeC.pose.p
+        half_size = self._cube_half_size(env, dtype=cubeA_pos.dtype)
+        xy_thresh = torch.linalg.norm(2 * half_size[:2]) + 0.005
+
+        base_pair_ready = (
+            torch.linalg.norm((cubeA_pos - cubeB_pos)[:, :2], dim=1) <= xy_thresh
+        ) & env.cubeA.is_static(lin_thresh=0.01, ang_thresh=0.5)
+        base_pair_ready = base_pair_ready & (~env.agent.is_grasping(env.cubeA))
+
+        is_cubeC_grasped = env.agent.is_grasping(env.cubeC)
+        is_C_on_A = (
+            torch.linalg.norm((cubeC_pos - cubeA_pos)[:, :2], dim=1) <= xy_thresh
+        ) & (torch.abs(cubeC_pos[:, 2] - cubeA_pos[:, 2]) > 0.02)
+        is_C_on_B = (
+            torch.linalg.norm((cubeC_pos - cubeB_pos)[:, :2], dim=1) <= xy_thresh
+        ) & (torch.abs(cubeC_pos[:, 2] - cubeB_pos[:, 2]) > 0.02)
+        is_C_static = env.cubeC.is_static(lin_thresh=0.01, ang_thresh=0.5)
+
+        signals = {
+            "success": info["success"],
+            "base_pair_ready": base_pair_ready,
+            "is_cubeC_grasped": is_cubeC_grasped,
+            "is_C_on_A": is_C_on_A,
+            "is_C_on_B": is_C_on_B,
+            "is_C_static": is_C_static,
+            "cubeC_goal_point_world": self._compute_cubeC_goal_point(env),
+        }
+        if env_idx is None:
+            return signals
+        return {
+            key: value[env_idx] if torch.is_tensor(value) else value
+            for key, value in signals.items()
+        }
+
+    def reset(self, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            self.phase.fill_(int(StackPyramidSkillPhase.PUSH_BASE))
+        else:
+            self.phase[env_idx] = int(StackPyramidSkillPhase.PUSH_BASE)
+
+    def update(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        signals = self._compute_signals(env, env_idx)
+        base_pair_ready = signals["base_pair_ready"]
+        is_cubeC_grasped = signals["is_cubeC_grasped"]
+        success = signals["success"]
+
+        if env_idx is None:
+            phase = self.phase.clone()
+        else:
+            phase = self.phase[env_idx].clone()
+
+        push_base = phase == int(StackPyramidSkillPhase.PUSH_BASE)
+        pick_top = phase == int(StackPyramidSkillPhase.PICK_TOP)
+        place_top = phase == int(StackPyramidSkillPhase.PLACE_TOP)
+        phase[push_base & base_pair_ready] = int(StackPyramidSkillPhase.PICK_TOP)
+        phase[pick_top & is_cubeC_grasped] = int(StackPyramidSkillPhase.PLACE_TOP)
+        phase[place_top & success] = int(StackPyramidSkillPhase.DONE)
+
+        if env_idx is None:
+            self.phase.copy_(phase)
+        else:
+            self.phase[env_idx] = phase
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        env_idx = self._normalize_env_idx(env_idx)
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        push_base = phase == int(StackPyramidSkillPhase.PUSH_BASE)
+        pick_top = phase == int(StackPyramidSkillPhase.PICK_TOP)
+        place_top = phase == int(StackPyramidSkillPhase.PLACE_TOP)
+        done = phase == int(StackPyramidSkillPhase.DONE)
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[push_base] = SKILL_IDS["push"]
+        skill_id[pick_top] = SKILL_IDS["pick"]
+        skill_id[place_top] = SKILL_IDS["place"]
+
+        cubeA_pose = Pose.create(self._select(env.cubeA.pose.raw_pose, env_idx))
+        cubeB_pos = self._select(env.cubeB.pose.p, env_idx).reshape(-1, 3)
+        cubeC_pose = Pose.create(self._select(env.cubeC.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+
+        half_size = self._cube_half_size(env, dtype=cubeA_pose.p.dtype)
+        push_direction = self._compute_push_direction(cubeA_pose.p, cubeB_pos)
+        target_cubeA_center = cubeA_pose.p.clone()
+        target_cubeA_center[:, :2] = cubeB_pos[:, :2] - 0.04 * push_direction
+        push_target_pos = target_cubeA_center.clone()
+        push_target_pos[:, :2] = push_target_pos[:, :2] - push_direction * (
+            half_size[0] + 0.005
+        )
+        push_target_pose = Pose.create_from_pq(p=push_target_pos, q=tcp_pose.q)
+
+        pick_target_pose = build_panda_topdown_grasp_pose(
+            center=cubeC_pose.p,
+            tcp_pose=tcp_pose,
+            object_pose=cubeC_pose,
+        )
+
+        cubeC_goal_point = self._select(
+            self._compute_cubeC_goal_point(env), env_idx
+        ).reshape(-1, 3)
+        desired_cubeC_pose = Pose.create_from_pq(p=cubeC_goal_point, q=cubeC_pose.q)
+        place_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=cubeC_pose,
+            desired_object_pose=desired_cubeC_pose,
+        )
+
+        target_pose_world = push_target_pose.to_transformation_matrix()
+        target_pose_world = torch.where(
+            pick_top[:, None, None],
+            pick_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world = torch.where(
+            place_top[:, None, None],
+            place_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
+
+        target_gripper_width = torch.full(
+            phase.shape,
+            float("nan"),
+            dtype=torch.float32,
+            device=phase.device,
+        )
+        target_gripper_width[push_base] = 0.0
+        target_gripper_width[place_top] = 0.08
+
+        phase_names_by_id = {
+            int(StackPyramidSkillPhase.PUSH_BASE): "push_base",
+            int(StackPyramidSkillPhase.PICK_TOP): "pick_top",
+            int(StackPyramidSkillPhase.PLACE_TOP): "place_top",
+            int(StackPyramidSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(StackPyramidSkillPhase.PUSH_BASE): "push",
+            int(StackPyramidSkillPhase.PICK_TOP): "pick",
+            int(StackPyramidSkillPhase.PLACE_TOP): "place",
+            int(StackPyramidSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(StackPyramidSkillPhase.PUSH_BASE): "push_cubeA_next_to_cubeB",
+            int(StackPyramidSkillPhase.PICK_TOP): "grasp_cubeC",
+            int(StackPyramidSkillPhase.PLACE_TOP): "place_cubeC_on_base_pair",
+            int(StackPyramidSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+        target_objects = [
+            None if x == int(StackPyramidSkillPhase.DONE) else "tcp"
+            for x in phase_ids
+        ]
+        active_objects = []
+        for phase_id in phase_ids:
+            if phase_id == int(StackPyramidSkillPhase.PUSH_BASE):
+                active_objects.append("cubeA")
+            elif phase_id == int(StackPyramidSkillPhase.DONE):
+                active_objects.append(None)
+            else:
+                active_objects.append("cubeC")
+
+        signals = self._compute_signals(env, env_idx)
+        task_meta = {
+            "task": "StackPyramid-v1",
+            "target_frame": "world",
+            "target_entity": "tcp",
+            "success": signals["success"],
+            "base_pair_ready": signals["base_pair_ready"],
+            "is_cubeC_grasped": signals["is_cubeC_grasped"],
+            "is_C_on_A": signals["is_C_on_A"],
+            "is_C_on_B": signals["is_C_on_B"],
+            "is_C_static": signals["is_C_static"],
+            "cubeC_goal_point_world": signals["cubeC_goal_point_world"],
+        }
+
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=target_point_world,
+            target_pose_world=target_pose_world,
+            target_gripper_width=target_gripper_width,
+            active_object=active_objects,
+            target_object=target_objects,
+            task_meta=task_meta,
+        )
 
 
 @register_env("StackPyramid-v1", max_episode_steps=250)
@@ -136,6 +390,19 @@ class StackPyramidEnv(BaseEnv):
                 lock_z=False,
             )
             self.cubeC.set_pose(Pose.create_from_pq(p=xyz, q=qs))
+            self._get_or_create_skill_annotation_fsm().reset(env_idx)
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, StackPyramidSkillFSM):
+            fsm = StackPyramidSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     def evaluate(self):
         pos_A = self.cubeA.pose.p
