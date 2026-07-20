@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Any, Union
 
 import numpy as np
@@ -13,8 +14,157 @@ from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.geometry import rotation_conversions
 from mani_skill.utils.registration import register_env
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
+
+
+class PokeCubeSkillPhase(IntEnum):
+    PICK = 0
+    ALIGN = 1
+    PUSH = 2
+    DONE = 3
+
+
+class PokeCubeSkillFSM:
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(PokeCubeSkillPhase.PICK),
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _normalize_env_idx(self, env_idx=None):
+        if env_idx is None:
+            return None
+        if torch.is_tensor(env_idx):
+            return env_idx.to(device=self.phase.device, dtype=torch.long).flatten()
+        return torch.as_tensor(
+            env_idx, device=self.phase.device, dtype=torch.long
+        ).flatten()
+
+    def _select(self, tensor: torch.Tensor, env_idx=None) -> torch.Tensor:
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            return tensor
+        return tensor[env_idx]
+
+    def reset(self, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            self.phase.fill_(int(PokeCubeSkillPhase.PICK))
+        else:
+            self.phase[env_idx] = int(PokeCubeSkillPhase.PICK)
+
+    def update(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        info = env.evaluate()
+        is_peg_grasped = info["is_peg_grasped"]
+        is_peg_cube_fit = info["is_peg_cube_fit"]
+        success = info["success"]
+
+        if env_idx is None:
+            phase = self.phase.clone()
+        else:
+            phase = self.phase[env_idx].clone()
+            is_peg_grasped = is_peg_grasped[env_idx]
+            is_peg_cube_fit = is_peg_cube_fit[env_idx]
+            success = success[env_idx]
+
+        pick = phase == int(PokeCubeSkillPhase.PICK)
+        align = phase == int(PokeCubeSkillPhase.ALIGN)
+        push = phase == int(PokeCubeSkillPhase.PUSH)
+        active = align | push
+        phase[pick & is_peg_grasped] = int(PokeCubeSkillPhase.ALIGN)
+        phase[align & is_peg_grasped & is_peg_cube_fit] = int(
+            PokeCubeSkillPhase.PUSH
+        )
+        phase[push & success] = int(PokeCubeSkillPhase.DONE)
+        phase[active & ~is_peg_grasped & ~success] = int(PokeCubeSkillPhase.PICK)
+
+        if env_idx is None:
+            self.phase.copy_(phase)
+        else:
+            self.phase[env_idx] = phase
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        env_idx = self._normalize_env_idx(env_idx)
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        pick = phase == int(PokeCubeSkillPhase.PICK)
+        align = phase == int(PokeCubeSkillPhase.ALIGN)
+        push = phase == int(PokeCubeSkillPhase.PUSH)
+        goal_target = push | (phase == int(PokeCubeSkillPhase.DONE))
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[pick] = SKILL_IDS["pick"]
+        skill_id[align] = SKILL_IDS["push"]
+        skill_id[push] = SKILL_IDS["push"]
+
+        peg_pos = self._select(env.peg.pose.p, env_idx).reshape(-1, 3)
+        cube_pos = self._select(env.cube.pose.p, env_idx).reshape(-1, 3)
+        goal_pos = self._select(env.goal_region.pose.p, env_idx).reshape(-1, 3).clone()
+        goal_pos[:, 2] = env.cube_half_size
+        target_point_world = torch.where(
+            goal_target[:, None],
+            goal_pos,
+            torch.where(align[:, None], cube_pos, peg_pos),
+        )
+
+        phase_names_by_id = {
+            int(PokeCubeSkillPhase.PICK): "pick",
+            int(PokeCubeSkillPhase.ALIGN): "align",
+            int(PokeCubeSkillPhase.PUSH): "push",
+            int(PokeCubeSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(PokeCubeSkillPhase.PICK): "pick",
+            int(PokeCubeSkillPhase.ALIGN): "push",
+            int(PokeCubeSkillPhase.PUSH): "push",
+            int(PokeCubeSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(PokeCubeSkillPhase.PICK): "move_to_peg",
+            int(PokeCubeSkillPhase.ALIGN): "align_peg_with_cube",
+            int(PokeCubeSkillPhase.PUSH): "push_cube_to_goal",
+            int(PokeCubeSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+        target_objects_by_phase_id = {
+            int(PokeCubeSkillPhase.PICK): "peg",
+            int(PokeCubeSkillPhase.ALIGN): "cube",
+            int(PokeCubeSkillPhase.PUSH): "goal_region",
+            int(PokeCubeSkillPhase.DONE): "goal_region",
+        }
+        target_objects = [target_objects_by_phase_id[x] for x in phase_ids]
+
+        info = env.evaluate()
+        task_meta = {
+            "task": "PokeCube-v1",
+            "target_frame": "world",
+            "success": self._select(info["success"], env_idx),
+            "is_cube_placed": self._select(info["is_cube_placed"], env_idx),
+            "is_peg_cube_fit": self._select(info["is_peg_cube_fit"], env_idx),
+            "is_peg_grasped": self._select(info["is_peg_grasped"], env_idx),
+            "angle_diff": self._select(info["angle_diff"], env_idx),
+            "head_to_cube_dist": self._select(info["head_to_cube_dist"], env_idx),
+        }
+
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=target_point_world,
+            target_pose_world=None,
+            target_gripper_width=None,
+            active_object=["peg"] * len(phase_ids),
+            target_object=target_objects,
+            task_meta=task_meta,
+        )
 
 
 @register_env("PokeCube-v1", max_episode_steps=50)
@@ -139,6 +289,19 @@ class PokeCubeEnv(BaseEnv):
             goal_region_q = euler2quat(0, np.pi / 2, 0)
             goal_region_pose = Pose.create_from_pq(p=goal_region_xyz, q=goal_region_q)
             self.goal_region.set_pose(goal_region_pose)
+            self._get_or_create_skill_annotation_fsm().reset(env_idx)
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, PokeCubeSkillFSM):
+            fsm = PokeCubeSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     def _get_obs_extra(self, info: dict):
         obs = dict(

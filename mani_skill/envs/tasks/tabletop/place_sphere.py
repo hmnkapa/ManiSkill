@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Any, Union
 
 import gymnasium as gym
@@ -15,9 +16,139 @@ from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
+
+
+class PlaceSphereSkillPhase(IntEnum):
+    PICK = 0
+    PLACE = 1
+    DONE = 2
+
+
+class PlaceSphereSkillFSM:
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(PlaceSphereSkillPhase.PICK),
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _normalize_env_idx(self, env_idx=None):
+        if env_idx is None:
+            return None
+        if torch.is_tensor(env_idx):
+            return env_idx.to(device=self.phase.device, dtype=torch.long).flatten()
+        return torch.as_tensor(
+            env_idx, device=self.phase.device, dtype=torch.long
+        ).flatten()
+
+    def _select(self, tensor: torch.Tensor, env_idx=None) -> torch.Tensor:
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            return tensor
+        return tensor[env_idx]
+
+    def reset(self, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            self.phase.fill_(int(PlaceSphereSkillPhase.PICK))
+        else:
+            self.phase[env_idx] = int(PlaceSphereSkillPhase.PICK)
+
+    def update(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        info = env.evaluate()
+        is_grasped = info["is_obj_grasped"]
+        is_on_bin = info["is_obj_on_bin"]
+        success = info["success"]
+
+        if env_idx is None:
+            phase = self.phase.clone()
+        else:
+            phase = self.phase[env_idx].clone()
+            is_grasped = is_grasped[env_idx]
+            is_on_bin = is_on_bin[env_idx]
+            success = success[env_idx]
+
+        pick = phase == int(PlaceSphereSkillPhase.PICK)
+        place = phase == int(PlaceSphereSkillPhase.PLACE)
+        phase[pick & is_grasped] = int(PlaceSphereSkillPhase.PLACE)
+        phase[place & success] = int(PlaceSphereSkillPhase.DONE)
+        phase[place & ~is_grasped & ~is_on_bin & ~success] = int(
+            PlaceSphereSkillPhase.PICK
+        )
+
+        if env_idx is None:
+            self.phase.copy_(phase)
+        else:
+            self.phase[env_idx] = phase
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        env_idx = self._normalize_env_idx(env_idx)
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        pick = phase == int(PlaceSphereSkillPhase.PICK)
+        place = phase == int(PlaceSphereSkillPhase.PLACE)
+        bin_target = place | (phase == int(PlaceSphereSkillPhase.DONE))
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[pick] = SKILL_IDS["pick"]
+        skill_id[place] = SKILL_IDS["place"]
+
+        obj_pos = self._select(env.obj.pose.p, env_idx).reshape(-1, 3)
+        bin_top_pos = self._select(env.bin.pose.p, env_idx).reshape(-1, 3).clone()
+        bin_top_pos[:, 2] = bin_top_pos[:, 2] + env.block_half_size[0] + env.radius
+        target_point_world = torch.where(bin_target[:, None], bin_top_pos, obj_pos)
+
+        phase_names_by_id = {
+            int(PlaceSphereSkillPhase.PICK): "pick",
+            int(PlaceSphereSkillPhase.PLACE): "place",
+            int(PlaceSphereSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(PlaceSphereSkillPhase.PICK): "pick",
+            int(PlaceSphereSkillPhase.PLACE): "place",
+            int(PlaceSphereSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(PlaceSphereSkillPhase.PICK): "move_to_sphere",
+            int(PlaceSphereSkillPhase.PLACE): "move_to_bin",
+            int(PlaceSphereSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+        target_objects = [
+            "sphere" if x == int(PlaceSphereSkillPhase.PICK) else "bin"
+            for x in phase_ids
+        ]
+
+        info = env.evaluate()
+        task_meta = {
+            "task": "PlaceSphere-v1",
+            "target_frame": "world",
+            "is_obj_grasped": self._select(info["is_obj_grasped"], env_idx),
+            "is_obj_on_bin": self._select(info["is_obj_on_bin"], env_idx),
+            "is_obj_static": self._select(info["is_obj_static"], env_idx),
+            "success": self._select(info["success"], env_idx),
+        }
+
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=target_point_world,
+            target_pose_world=None,
+            target_gripper_width=None,
+            active_object=["sphere"] * len(phase_ids),
+            target_object=target_objects,
+            task_meta=task_meta,
+        )
 
 
 @register_env("PlaceSphere-v1", max_episode_steps=50)
@@ -180,6 +311,19 @@ class PlaceSphereEnv(BaseEnv):
             q = [1, 0, 0, 0]
             bin_pose = Pose.create_from_pq(p=pos, q=q)
             self.bin.set_pose(bin_pose)
+            self._get_or_create_skill_annotation_fsm().reset(env_idx)
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, PlaceSphereSkillFSM):
+            fsm = PlaceSphereSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     def evaluate(self):
         pos_obj = self.obj.pose.p
