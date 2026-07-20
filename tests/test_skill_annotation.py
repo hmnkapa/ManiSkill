@@ -18,6 +18,22 @@ from mani_skill.envs.tasks.tabletop.poke_cube import (
     PokeCubeSkillFSM,
     PokeCubeSkillPhase,
 )
+from mani_skill.envs.tasks.tabletop.pull_cube import (
+    PullCubeSkillFSM,
+    PullCubeSkillPhase,
+)
+from mani_skill.envs.tasks.tabletop.pull_cube_tool import (
+    PullCubeToolSkillFSM,
+    PullCubeToolSkillPhase,
+)
+from mani_skill.envs.tasks.tabletop.push_cube import (
+    PushCubeSkillFSM,
+    PushCubeSkillPhase,
+)
+from mani_skill.envs.tasks.tabletop.roll_ball import (
+    RollBallSkillFSM,
+    RollBallSkillPhase,
+)
 from mani_skill.envs.tasks.tabletop.stack_cube import (
     StackCubeSkillFSM,
     StackCubeSkillPhase,
@@ -412,6 +428,125 @@ def test_peg_insertion_side_skill_fsm_transitions_through_pre_insert():
     assert fsm.phase.tolist() == [int(PegInsertionSideSkillPhase.DONE)]
 
 
+def test_pull_cube_tool_skill_fsm_transitions_through_pull():
+    env = _PullCubeToolFSMEnv()
+    fsm = PullCubeToolSkillFSM(num_envs=1, device="cpu")
+
+    assert fsm.phase.tolist() == [int(PullCubeToolSkillPhase.PICK)]
+
+    env.set_tool_grasped(True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PullCubeToolSkillPhase.ALIGN)]
+    assert env.agent.max_angle_calls[-1] == 20
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["push"]]
+    assert context.phase == ["align"]
+    assert context.skill_state == ["position_hook_behind_cube"]
+    assert context.target_object == ["tcp"]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PullCubeToolSkillPhase.ALIGN)]
+
+    env.set_tool_positioned(True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PullCubeToolSkillPhase.PULL)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["push"]]
+    assert context.phase == ["pull"]
+    assert context.skill_state == ["pull_cube_into_workspace"]
+
+    env.set_info(success=True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PullCubeToolSkillPhase.DONE)]
+
+    env.set_tool_grasped(False)
+    env.set_info(success=False)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PullCubeToolSkillPhase.DONE)]
+
+
+def test_push_cube_skill_fsm_transitions_through_push():
+    env = _PushCubeFSMEnv()
+    fsm = PushCubeSkillFSM(num_envs=1, device="cpu")
+
+    assert fsm.phase.tolist() == [int(PushCubeSkillPhase.ALIGN)]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PushCubeSkillPhase.ALIGN)]
+
+    env.move_tcp_to_push_pose()
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PushCubeSkillPhase.PUSH)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["push"]]
+    assert context.phase == ["push"]
+    assert context.skill_state == ["push_cube_to_goal"]
+    assert context.target_object == ["tcp"]
+
+    env.set_info(success=True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PushCubeSkillPhase.DONE)]
+
+    env.set_info(success=False)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PushCubeSkillPhase.DONE)]
+
+
+def test_pull_cube_skill_fsm_transitions_through_pull():
+    env = _PullCubeFSMEnv()
+    fsm = PullCubeSkillFSM(num_envs=1, device="cpu")
+
+    assert fsm.phase.tolist() == [int(PullCubeSkillPhase.ALIGN)]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PullCubeSkillPhase.ALIGN)]
+
+    env.move_tcp_to_pull_pose()
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PullCubeSkillPhase.PULL)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["push"]]
+    assert context.phase == ["pull"]
+    assert context.skill_state == ["pull_cube_to_goal"]
+    assert context.target_object == ["tcp"]
+
+    env.set_info(success=True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PullCubeSkillPhase.DONE)]
+
+    env.set_info(success=False)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PullCubeSkillPhase.DONE)]
+
+
+def test_roll_ball_skill_fsm_transitions_through_roll_without_reached_status():
+    env = _RollBallFSMEnv()
+    fsm = RollBallSkillFSM(num_envs=1, device="cpu")
+
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.ALIGN)]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.ALIGN)]
+
+    env.move_tcp_to_hit_pose()
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.ROLL)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["push"]]
+    assert context.phase == ["roll"]
+    assert context.skill_state == ["roll_ball_to_goal"]
+    assert context.target_object == ["tcp"]
+
+    env.reached_status.fill_(0.0)
+    env.set_info(success=True)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.DONE)]
+
+    env.set_info(success=False)
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.DONE)]
+
+
 def test_tabletop_skill_fsm_contexts_normalize_for_all_tcp_target_tasks():
     cases = [
         (
@@ -451,6 +586,34 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_tcp_target_tasks():
             ],
             [SKILL_IDS["pick"], SKILL_IDS["insert"]],
             "PegInsertionSide-v1",
+        ),
+        (
+            PullCubeToolSkillFSM,
+            _PullCubeToolFSMEnv(num_envs=2),
+            [PullCubeToolSkillPhase.PICK, PullCubeToolSkillPhase.ALIGN],
+            [SKILL_IDS["pick"], SKILL_IDS["push"]],
+            "PullCubeTool-v1",
+        ),
+        (
+            PushCubeSkillFSM,
+            _PushCubeFSMEnv(num_envs=2),
+            [PushCubeSkillPhase.ALIGN, PushCubeSkillPhase.PUSH],
+            [SKILL_IDS["push"], SKILL_IDS["push"]],
+            "PushCube-v1",
+        ),
+        (
+            PullCubeSkillFSM,
+            _PullCubeFSMEnv(num_envs=2),
+            [PullCubeSkillPhase.ALIGN, PullCubeSkillPhase.PULL],
+            [SKILL_IDS["push"], SKILL_IDS["push"]],
+            "PullCube-v1",
+        ),
+        (
+            RollBallSkillFSM,
+            _RollBallFSMEnv(num_envs=2),
+            [RollBallSkillPhase.ALIGN, RollBallSkillPhase.ROLL],
+            [SKILL_IDS["push"], SKILL_IDS["push"]],
+            "RollBall-v1",
         ),
     ]
 
@@ -530,6 +693,34 @@ def test_tabletop_skill_fsm_tcp_target_geometry_for_every_active_phase():
             ],
             [[-0.06, 0.0, 0.0], [-0.01, 0.0, 0.25], [0.15, 0.0, 0.25]],
         ),
+        (
+            PullCubeToolSkillFSM,
+            _PullCubeToolFSMEnv(num_envs=3),
+            [
+                PullCubeToolSkillPhase.PICK,
+                PullCubeToolSkillPhase.ALIGN,
+                PullCubeToolSkillPhase.PULL,
+            ],
+            [[0.02, 0.0, 0.025], [0.03, -0.067, 0.2], [-0.32, -0.067, 0.2]],
+        ),
+        (
+            PushCubeSkillFSM,
+            _PushCubeFSMEnv(num_envs=2),
+            [PushCubeSkillPhase.ALIGN, PushCubeSkillPhase.PUSH],
+            [[-0.025, 0.0, 0.02], [0.08, 0.1, 0.02]],
+        ),
+        (
+            PullCubeSkillFSM,
+            _PullCubeFSMEnv(num_envs=2),
+            [PullCubeSkillPhase.ALIGN, PullCubeSkillPhase.PULL],
+            [[0.03, 0.0, 0.02], [-0.15, -0.1, 0.02]],
+        ),
+        (
+            RollBallSkillFSM,
+            _RollBallFSMEnv(num_envs=2),
+            [RollBallSkillPhase.ALIGN, RollBallSkillPhase.ROLL],
+            [[0.0, 0.085, 0.035], [0.0, -0.115, 0.035]],
+        ),
     ]
 
     for fsm_cls, env, phases, expected_points in cases:
@@ -582,6 +773,14 @@ def test_tabletop_skill_fsm_done_has_no_tcp_target():
             _PegInsertionSideFSMEnv(num_envs=2),
             PegInsertionSideSkillPhase.DONE,
         ),
+        (
+            PullCubeToolSkillFSM,
+            _PullCubeToolFSMEnv(num_envs=2),
+            PullCubeToolSkillPhase.DONE,
+        ),
+        (PushCubeSkillFSM, _PushCubeFSMEnv(num_envs=2), PushCubeSkillPhase.DONE),
+        (PullCubeSkillFSM, _PullCubeFSMEnv(num_envs=2), PullCubeSkillPhase.DONE),
+        (RollBallSkillFSM, _RollBallFSMEnv(num_envs=2), RollBallSkillPhase.DONE),
     ]
 
     for fsm_cls, env, done_phase in cases:
@@ -591,11 +790,107 @@ def test_tabletop_skill_fsm_done_has_no_tcp_target():
 
         assert torch.isnan(context.target_pose_world).all()
         assert torch.isnan(context.target_point_world).all()
+        if context.target_gripper_width is not None:
+            assert torch.isnan(context.target_gripper_width).all()
         assert context.target_object == [None, None]
 
         normalized = normalize_skill_context(context, num_envs=2, device="cpu")
         assert normalized.target_pose_valid.tolist() == [False, False]
         assert normalized.target_point_valid.tolist() == [False, False]
+        assert normalized.target_gripper_width_valid.tolist() == [False, False]
+
+
+def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
+    cases = [
+        (
+            PullCubeToolSkillFSM,
+            _PullCubeToolFSMEnv(num_envs=3),
+            [
+                PullCubeToolSkillPhase.PICK,
+                PullCubeToolSkillPhase.ALIGN,
+                PullCubeToolSkillPhase.PULL,
+            ],
+            "PullCubeTool-v1",
+            {
+                "success",
+                "is_tool_grasped",
+                "tool_positioned",
+                "tool_positioning_dist",
+                "cube_to_base_dist",
+                "workspace_target_world",
+            },
+        ),
+        (
+            PushCubeSkillFSM,
+            _PushCubeFSMEnv(num_envs=2),
+            [PushCubeSkillPhase.ALIGN, PushCubeSkillPhase.PUSH],
+            "PushCube-v1",
+            {
+                "success",
+                "reached_push_pose",
+                "tcp_to_push_dist",
+                "obj_to_goal_dist",
+                "is_obj_on_table",
+                "push_direction_world",
+                "object_goal_point_world",
+            },
+        ),
+        (
+            PullCubeSkillFSM,
+            _PullCubeFSMEnv(num_envs=2),
+            [PullCubeSkillPhase.ALIGN, PullCubeSkillPhase.PULL],
+            "PullCube-v1",
+            {
+                "success",
+                "reached_pull_pose",
+                "tcp_to_pull_dist",
+                "obj_to_goal_dist",
+                "pull_direction_world",
+                "object_goal_point_world",
+            },
+        ),
+        (
+            RollBallSkillFSM,
+            _RollBallFSMEnv(num_envs=2),
+            [RollBallSkillPhase.ALIGN, RollBallSkillPhase.ROLL],
+            "RollBall-v1",
+            {
+                "success",
+                "reached_hit_pose",
+                "tcp_to_hit_dist",
+                "ball_to_goal_dist",
+                "roll_direction_world",
+                "object_goal_point_world",
+            },
+        ),
+    ]
+
+    for fsm_cls, env, phases, task_name, meta_keys in cases:
+        fsm = fsm_cls(num_envs=len(phases), device="cpu")
+        fsm.phase.copy_(torch.tensor([int(x) for x in phases], dtype=torch.long))
+
+        context = fsm.build_context(env)
+        normalized = normalize_skill_context(
+            context, num_envs=len(phases), device="cpu"
+        )
+
+        assert normalized.target_gripper_width_valid.tolist() == [True] * len(phases)
+        assert torch.allclose(
+            normalized.target_gripper_width,
+            torch.zeros(len(phases), dtype=torch.float32),
+        )
+        assert context.task_meta["task"] == task_name
+        assert context.task_meta["target_frame"] == "world"
+        assert context.task_meta["target_entity"] == "tcp"
+        assert meta_keys.issubset(context.task_meta.keys())
+
+        selected_context = fsm.build_context(env, env_idx=[1])
+        assert selected_context.phase_id.tolist() == [1]
+        assert selected_context.target_gripper_width.tolist() == [0.0]
+        for key in meta_keys:
+            value = selected_context.task_meta[key]
+            if torch.is_tensor(value):
+                assert value.shape[0] == 1
 
 
 @pytest.mark.parametrize(
@@ -606,6 +901,10 @@ def test_tabletop_skill_fsm_done_has_no_tcp_target():
         "StackCube-v1",
         "PokeCube-v1",
         "PegInsertionSide-v1",
+        "PullCubeTool-v1",
+        "PushCube-v1",
+        "PullCube-v1",
+        "RollBall-v1",
     ],
 )
 def test_tabletop_skill_annotation_context_smoke_after_reset(env_id):
@@ -817,8 +1116,18 @@ class _ActorStub:
         self.pose = _PoseStub(p, q)
 
 
+class _RobotStub:
+    def __init__(self, num_envs, base_p=None):
+        if base_p is None:
+            base_p = torch.zeros((num_envs, 3), dtype=torch.float32)
+        self._links = [_ActorStub(base_p)]
+
+    def get_links(self):
+        return self._links
+
+
 class _GraspingAgentStub:
-    def __init__(self, num_envs, tcp_p=None, tcp_q=None):
+    def __init__(self, num_envs, tcp_p=None, tcp_q=None, base_p=None):
         self.num_envs = num_envs
         self.is_grasped = torch.zeros(num_envs, dtype=torch.bool)
         self.max_angle_calls = []
@@ -831,10 +1140,14 @@ class _GraspingAgentStub:
                 num_envs, 1
             )
         self.tcp = _ActorStub(tcp_p, tcp_q)
+        self.robot = _RobotStub(num_envs, base_p=base_p)
 
     def is_grasping(self, actor, max_angle=None):
         self.max_angle_calls.append(max_angle)
         return self.is_grasped
+
+    def set_tcp_pos(self, tcp_p):
+        self.tcp = _ActorStub(tcp_p, self.tcp.pose.q)
 
 
 class _PickCubeFSMEnv:
@@ -1012,6 +1325,154 @@ class _PegInsertionSideFSMEnv:
     def get_peg_pre_insertion_info(self):
         distance = torch.zeros(self.num_envs, dtype=torch.float32)
         return self.pre_inserted, distance, distance
+
+
+class _PullCubeToolFSMEnv:
+    device = "cpu"
+    cube_half_size = 0.02
+    hook_length = 0.05
+
+    def __init__(self, num_envs=1):
+        self.num_envs = num_envs
+        self.cube = _ActorStub(
+            torch.tensor([[0.2, 0.0, 0.025]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.l_shape_tool = _ActorStub(
+            torch.tensor([[0.0, 0.0, 0.025]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.agent = _GraspingAgentStub(num_envs)
+        self.set_info()
+
+    def set_info(self, success=False):
+        self._info = {
+            "success": _bool_tensor(success, self.num_envs),
+            "success_once": _bool_tensor(success, self.num_envs),
+            "success_at_end": _bool_tensor(success, self.num_envs),
+        }
+
+    def set_tool_grasped(self, is_grasped):
+        self.agent.is_grasped = _bool_tensor(is_grasped, self.num_envs)
+
+    def set_tool_positioned(self, positioned):
+        if positioned:
+            tool_pos = self.cube.pose.p + torch.tensor(
+                [-(self.hook_length + self.cube_half_size), -0.067, 0],
+                dtype=torch.float32,
+            )
+        else:
+            tool_pos = torch.tensor([[0.0, 0.0, 0.025]], dtype=torch.float32).repeat(
+                self.num_envs, 1
+            )
+        self.l_shape_tool = _ActorStub(tool_pos, self.l_shape_tool.pose.q)
+
+    def evaluate(self):
+        return {key: value.clone() for key, value in self._info.items()}
+
+
+class _PushCubeFSMEnv:
+    device = "cpu"
+    cube_half_size = 0.02
+
+    def __init__(self, num_envs=1):
+        self.num_envs = num_envs
+        self.obj = _ActorStub(
+            torch.tensor([[0.0, 0.0, self.cube_half_size]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.goal_region = _ActorStub(
+            torch.tensor([[0.2, 0.1, 0.001]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.agent = _GraspingAgentStub(num_envs)
+        self.set_info()
+
+    def set_info(self, success=False):
+        self._info = {"success": _bool_tensor(success, self.num_envs)}
+
+    def move_tcp_to_push_pose(self):
+        self.agent.set_tcp_pos(
+            self.obj.pose.p
+            + torch.tensor([-self.cube_half_size - 0.005, 0, 0], dtype=torch.float32)
+        )
+
+    def evaluate(self):
+        return {key: value.clone() for key, value in self._info.items()}
+
+
+class _PullCubeFSMEnv:
+    device = "cpu"
+    cube_half_size = 0.02
+
+    def __init__(self, num_envs=1):
+        self.num_envs = num_envs
+        self.obj = _ActorStub(
+            torch.tensor([[0.0, 0.0, self.cube_half_size]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.goal_region = _ActorStub(
+            torch.tensor([[-0.2, -0.1, 0.001]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.agent = _GraspingAgentStub(num_envs)
+        self.set_info()
+
+    def set_info(self, success=False):
+        self._info = {"success": _bool_tensor(success, self.num_envs)}
+
+    def move_tcp_to_pull_pose(self):
+        self.agent.set_tcp_pos(
+            self.obj.pose.p
+            + torch.tensor([self.cube_half_size + 0.01, 0, 0], dtype=torch.float32)
+        )
+
+    def evaluate(self):
+        return {key: value.clone() for key, value in self._info.items()}
+
+
+class _RollBallFSMEnv:
+    device = "cpu"
+    ball_radius = 0.035
+
+    def __init__(self, num_envs=1):
+        self.num_envs = num_envs
+        self.ball = _ActorStub(
+            torch.tensor([[0.0, 0.0, self.ball_radius]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.goal_region = _ActorStub(
+            torch.tensor([[0.0, -0.2, 0.001]], dtype=torch.float32).repeat(
+                num_envs, 1
+            )
+        )
+        self.agent = _GraspingAgentStub(num_envs)
+        self.reached_status = torch.zeros(num_envs, dtype=torch.float32)
+        self.set_info()
+
+    def set_info(self, success=False):
+        self._info = {"success": _bool_tensor(success, self.num_envs)}
+
+    def move_tcp_to_hit_pose(self):
+        direction_xy = self.goal_region.pose.p[:, :2] - self.ball.pose.p[:, :2]
+        direction_xy = direction_xy / torch.linalg.norm(
+            direction_xy, dim=1, keepdim=True
+        )
+        direction = torch.zeros_like(self.ball.pose.p)
+        direction[:, :2] = direction_xy
+        self.agent.set_tcp_pos(
+            self.ball.pose.p - direction * (self.ball_radius + 0.05)
+        )
+
+    def evaluate(self):
+        return {key: value.clone() for key, value in self._info.items()}
 
 
 class _ContextSequenceEnv:

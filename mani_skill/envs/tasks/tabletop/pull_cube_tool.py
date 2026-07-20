@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Any, Union
 
 import numpy as np
@@ -11,9 +12,222 @@ from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
+from mani_skill.utils.skill_annotation.targets import (
+    build_panda_topdown_grasp_pose,
+    target_tcp_pose_from_object_goal,
+)
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
+
+
+class PullCubeToolSkillPhase(IntEnum):
+    PICK = 0
+    ALIGN = 1
+    PULL = 2
+    DONE = 3
+
+
+class PullCubeToolSkillFSM:
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(PullCubeToolSkillPhase.PICK),
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _normalize_env_idx(self, env_idx=None):
+        if env_idx is None:
+            return None
+        if torch.is_tensor(env_idx):
+            return env_idx.to(device=self.phase.device, dtype=torch.long).flatten()
+        return torch.as_tensor(
+            env_idx, device=self.phase.device, dtype=torch.long
+        ).flatten()
+
+    def _select(self, tensor: torch.Tensor, env_idx=None) -> torch.Tensor:
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            return tensor
+        return tensor[env_idx]
+
+    def _compute_signals(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        info = env.evaluate()
+        cube_pos = env.cube.pose.p
+        tool_pos = env.l_shape_tool.pose.p
+        robot_base_pos = env.agent.robot.get_links()[0].pose.p
+        ideal_tool_pos = cube_pos + torch.tensor(
+            [-(env.hook_length + env.cube_half_size), -0.067, 0],
+            device=env.device,
+        )
+        tool_positioning_dist = torch.linalg.norm(tool_pos - ideal_tool_pos, dim=1)
+        workspace_target_world = robot_base_pos + torch.tensor(
+            [0.05, 0, 0], device=env.device
+        )
+        signals = {
+            "success": info["success"],
+            "is_tool_grasped": env.agent.is_grasping(
+                env.l_shape_tool, max_angle=20
+            ),
+            "tool_positioned": tool_positioning_dist < 0.05,
+            "tool_positioning_dist": tool_positioning_dist,
+            "cube_to_base_dist": torch.linalg.norm(
+                cube_pos[:, :2] - robot_base_pos[:, :2], dim=1
+            ),
+            "workspace_target_world": workspace_target_world,
+            "ideal_tool_pos": ideal_tool_pos,
+        }
+        if env_idx is None:
+            return signals
+        return {
+            key: value[env_idx] if torch.is_tensor(value) else value
+            for key, value in signals.items()
+        }
+
+    def reset(self, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            self.phase.fill_(int(PullCubeToolSkillPhase.PICK))
+        else:
+            self.phase[env_idx] = int(PullCubeToolSkillPhase.PICK)
+
+    def update(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        signals = self._compute_signals(env, env_idx)
+        is_tool_grasped = signals["is_tool_grasped"]
+        tool_positioned = signals["tool_positioned"]
+        success = signals["success"]
+
+        if env_idx is None:
+            phase = self.phase.clone()
+        else:
+            phase = self.phase[env_idx].clone()
+
+        pick = phase == int(PullCubeToolSkillPhase.PICK)
+        align = phase == int(PullCubeToolSkillPhase.ALIGN)
+        pull = phase == int(PullCubeToolSkillPhase.PULL)
+        phase[pick & is_tool_grasped] = int(PullCubeToolSkillPhase.ALIGN)
+        phase[align & is_tool_grasped & tool_positioned] = int(
+            PullCubeToolSkillPhase.PULL
+        )
+        phase[pull & success] = int(PullCubeToolSkillPhase.DONE)
+
+        if env_idx is None:
+            self.phase.copy_(phase)
+        else:
+            self.phase[env_idx] = phase
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        env_idx = self._normalize_env_idx(env_idx)
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        pick = phase == int(PullCubeToolSkillPhase.PICK)
+        align = phase == int(PullCubeToolSkillPhase.ALIGN)
+        pull = phase == int(PullCubeToolSkillPhase.PULL)
+        done = phase == int(PullCubeToolSkillPhase.DONE)
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[pick] = SKILL_IDS["pick"]
+        skill_id[align] = SKILL_IDS["push"]
+        skill_id[pull] = SKILL_IDS["push"]
+
+        tool_pose = Pose.create(self._select(env.l_shape_tool.pose.raw_pose, env_idx))
+        cube_pose = Pose.create(self._select(env.cube.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        grasp_center = tool_pose.p + torch.tensor([0.02, 0, 0], device=env.device)
+        pick_target_pose = build_panda_topdown_grasp_pose(
+            center=grasp_center,
+            tcp_pose=tcp_pose,
+            object_pose=tool_pose,
+        )
+
+        ideal_tool_pos = cube_pose.p + torch.tensor(
+            [-(env.hook_length + env.cube_half_size), -0.067, 0],
+            device=env.device,
+        )
+        ideal_tool_pose = Pose.create_from_pq(p=ideal_tool_pos, q=tool_pose.q)
+        align_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=tool_pose,
+            desired_object_pose=ideal_tool_pose,
+        )
+        pull_target_pos = align_target_pose.p.clone()
+        pull_target_pos[:, 0] = pull_target_pos[:, 0] - 0.35
+        pull_target_pose = Pose.create_from_pq(p=pull_target_pos, q=align_target_pose.q)
+
+        target_pose_world = pick_target_pose.to_transformation_matrix()
+        target_pose_world = torch.where(
+            align[:, None, None],
+            align_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world = torch.where(
+            pull[:, None, None],
+            pull_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
+
+        target_gripper_width = torch.zeros(
+            phase.shape, dtype=torch.float32, device=phase.device
+        )
+        target_gripper_width[done] = float("nan")
+
+        phase_names_by_id = {
+            int(PullCubeToolSkillPhase.PICK): "pick",
+            int(PullCubeToolSkillPhase.ALIGN): "align",
+            int(PullCubeToolSkillPhase.PULL): "pull",
+            int(PullCubeToolSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(PullCubeToolSkillPhase.PICK): "pick",
+            int(PullCubeToolSkillPhase.ALIGN): "push",
+            int(PullCubeToolSkillPhase.PULL): "push",
+            int(PullCubeToolSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(PullCubeToolSkillPhase.PICK): "move_to_tool_grasp",
+            int(PullCubeToolSkillPhase.ALIGN): "position_hook_behind_cube",
+            int(PullCubeToolSkillPhase.PULL): "pull_cube_into_workspace",
+            int(PullCubeToolSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+        target_objects = [
+            None if x == int(PullCubeToolSkillPhase.DONE) else "tcp"
+            for x in phase_ids
+        ]
+
+        signals = self._compute_signals(env, env_idx)
+        task_meta = {
+            "task": "PullCubeTool-v1",
+            "target_frame": "world",
+            "target_entity": "tcp",
+            "success": signals["success"],
+            "is_tool_grasped": signals["is_tool_grasped"],
+            "tool_positioned": signals["tool_positioned"],
+            "tool_positioning_dist": signals["tool_positioning_dist"],
+            "cube_to_base_dist": signals["cube_to_base_dist"],
+            "workspace_target_world": signals["workspace_target_world"],
+        }
+
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=target_point_world,
+            target_pose_world=target_pose_world,
+            target_gripper_width=target_gripper_width,
+            active_object=["l_shape_tool"] * len(phase_ids),
+            target_object=target_objects,
+            task_meta=task_meta,
+        )
 
 
 @register_env("PullCubeTool-v1", max_episode_steps=100)
@@ -175,6 +389,19 @@ class PullCubeToolEnv(BaseEnv):
 
             cube_pose = Pose.create_from_pq(p=cube_xyz, q=cube_q)
             self.cube.set_pose(cube_pose)
+            self._get_or_create_skill_annotation_fsm().reset(env_idx)
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, PullCubeToolSkillFSM):
+            fsm = PullCubeToolSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     def _get_obs_extra(self, info: dict):
         obs = dict(
