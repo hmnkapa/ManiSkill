@@ -13,10 +13,7 @@ from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
-from mani_skill.utils.skill_annotation.targets import (
-    build_panda_topdown_grasp_pose,
-    target_tcp_pose_from_object_goal,
-)
+from mani_skill.utils.skill_annotation.targets import build_panda_topdown_grasp_pose
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
@@ -30,12 +27,21 @@ class PullCubeToolSkillPhase(IntEnum):
 
 
 class PullCubeToolSkillFSM:
+    ALIGN_TCP_TOLERANCE = 0.01
+    PULL_DISTANCE = 0.35
+
     def __init__(self, num_envs: int, device):
         self.phase = torch.full(
             (num_envs,),
             int(PullCubeToolSkillPhase.PICK),
             dtype=torch.long,
             device=device,
+        )
+        self.pull_target_pos = torch.full(
+            (num_envs, 3), float("nan"), dtype=torch.float32, device=device
+        )
+        self.pull_target_q = torch.full(
+            (num_envs, 4), float("nan"), dtype=torch.float32, device=device
         )
 
     def _normalize_env_idx(self, env_idx=None):
@@ -58,12 +64,19 @@ class PullCubeToolSkillFSM:
         info = env.evaluate()
         cube_pos = env.cube.pose.p
         tool_pos = env.l_shape_tool.pose.p
+        tcp_pos = env.agent.tcp.pose.p
         robot_base_pos = env.agent.robot.get_links()[0].pose.p
-        ideal_tool_pos = cube_pos + torch.tensor(
+
+        # The motion-planning solution defines this offset as the TCP hook pose,
+        # not as the origin pose of the L-shaped tool. Preserve the current rigid
+        # TCP-to-tool offset when deriving the corresponding tool actor target.
+        align_target_world = cube_pos + torch.tensor(
             [-(env.hook_length + env.cube_half_size), -0.067, 0],
             device=env.device,
         )
-        tool_positioning_dist = torch.linalg.norm(tool_pos - ideal_tool_pos, dim=1)
+        align_delta = align_target_world - tcp_pos
+        ideal_tool_pos = tool_pos + align_delta
+        tool_positioning_dist = torch.linalg.norm(align_delta, dim=1)
         workspace_target_world = robot_base_pos + torch.tensor(
             [0.05, 0, 0], device=env.device
         )
@@ -72,12 +85,13 @@ class PullCubeToolSkillFSM:
             "is_tool_grasped": env.agent.is_grasping(
                 env.l_shape_tool, max_angle=20
             ),
-            "tool_positioned": tool_positioning_dist < 0.05,
+            "tool_positioned": tool_positioning_dist < self.ALIGN_TCP_TOLERANCE,
             "tool_positioning_dist": tool_positioning_dist,
             "cube_to_base_dist": torch.linalg.norm(
                 cube_pos[:, :2] - robot_base_pos[:, :2], dim=1
             ),
             "workspace_target_world": workspace_target_world,
+            "align_target_world": align_target_world,
             "ideal_tool_pos": ideal_tool_pos,
         }
         if env_idx is None:
@@ -91,8 +105,12 @@ class PullCubeToolSkillFSM:
         env_idx = self._normalize_env_idx(env_idx)
         if env_idx is None:
             self.phase.fill_(int(PullCubeToolSkillPhase.PICK))
+            self.pull_target_pos.fill_(float("nan"))
+            self.pull_target_q.fill_(float("nan"))
         else:
             self.phase[env_idx] = int(PullCubeToolSkillPhase.PICK)
+            self.pull_target_pos[env_idx] = float("nan")
+            self.pull_target_q[env_idx] = float("nan")
 
     def update(self, env, env_idx=None):
         env_idx = self._normalize_env_idx(env_idx)
@@ -109,10 +127,26 @@ class PullCubeToolSkillFSM:
         pick = phase == int(PullCubeToolSkillPhase.PICK)
         align = phase == int(PullCubeToolSkillPhase.ALIGN)
         pull = phase == int(PullCubeToolSkillPhase.PULL)
-        phase[pick & is_tool_grasped] = int(PullCubeToolSkillPhase.ALIGN)
-        phase[align & is_tool_grasped & tool_positioned] = int(
-            PullCubeToolSkillPhase.PULL
+        enter_pull = align & is_tool_grasped & tool_positioned
+
+        # Latch a per-environment endpoint when ALIGN completes. The cube moves
+        # during PULL, so recomputing this point from the live cube pose would
+        # make the target retreat continuously instead of remaining an endpoint.
+        selected_indices = (
+            torch.arange(self.phase.shape[0], device=self.phase.device)
+            if env_idx is None
+            else env_idx
         )
+        entering_indices = selected_indices[enter_pull]
+        if entering_indices.numel() > 0:
+            pull_target_pos = signals["align_target_world"][enter_pull].clone()
+            pull_target_pos[:, 0] -= self.PULL_DISTANCE
+            tcp_q = self._select(env.agent.tcp.pose.q, env_idx)
+            self.pull_target_pos[entering_indices] = pull_target_pos
+            self.pull_target_q[entering_indices] = tcp_q[enter_pull]
+
+        phase[pick & is_tool_grasped] = int(PullCubeToolSkillPhase.ALIGN)
+        phase[enter_pull] = int(PullCubeToolSkillPhase.PULL)
         phase[pull & success] = int(PullCubeToolSkillPhase.DONE)
 
         if env_idx is None:
@@ -145,19 +179,32 @@ class PullCubeToolSkillFSM:
             object_pose=tool_pose,
         )
 
-        ideal_tool_pos = cube_pose.p + torch.tensor(
+        align_target_pos = cube_pose.p + torch.tensor(
             [-(env.hook_length + env.cube_half_size), -0.067, 0],
             device=env.device,
         )
-        ideal_tool_pose = Pose.create_from_pq(p=ideal_tool_pos, q=tool_pose.q)
-        align_target_pose = target_tcp_pose_from_object_goal(
-            current_tcp_pose=tcp_pose,
-            current_object_pose=tool_pose,
-            desired_object_pose=ideal_tool_pose,
+        align_target_pose = Pose.create_from_pq(
+            p=align_target_pos,
+            q=tcp_pose.q,
         )
-        pull_target_pos = align_target_pose.p.clone()
-        pull_target_pos[:, 0] = pull_target_pos[:, 0] - 0.35
-        pull_target_pose = Pose.create_from_pq(p=pull_target_pos, q=align_target_pose.q)
+        fallback_pull_target_pos = align_target_pose.p.clone()
+        fallback_pull_target_pos[:, 0] -= self.PULL_DISTANCE
+        stored_pull_target_pos = self._select(self.pull_target_pos, env_idx)
+        stored_pull_target_q = self._select(self.pull_target_q, env_idx)
+        stored_pull_target_valid = torch.isfinite(stored_pull_target_pos).all(
+            dim=1
+        ) & torch.isfinite(stored_pull_target_q).all(dim=1)
+        pull_target_pos = torch.where(
+            stored_pull_target_valid[:, None],
+            stored_pull_target_pos,
+            fallback_pull_target_pos,
+        )
+        pull_target_q = torch.where(
+            stored_pull_target_valid[:, None],
+            stored_pull_target_q,
+            align_target_pose.q,
+        )
+        pull_target_pose = Pose.create_from_pq(p=pull_target_pos, q=pull_target_q)
 
         target_pose_world = pick_target_pose.to_transformation_matrix()
         target_pose_world = torch.where(
