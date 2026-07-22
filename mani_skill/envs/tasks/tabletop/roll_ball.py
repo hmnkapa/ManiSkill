@@ -21,11 +21,14 @@ from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 
 class RollBallSkillPhase(IntEnum):
     ALIGN = 0
-    ROLL = 1
-    DONE = 2
+    HIT = 1
+    COAST = 2
+    DONE = 3
 
 
 class RollBallSkillFSM:
+    _BALL_FORWARD_SPEED_THRESHOLD = 0.1
+
     def __init__(self, num_envs: int, device):
         self.phase = torch.full(
             (num_envs,),
@@ -64,6 +67,9 @@ class RollBallSkillFSM:
         ball_pos = env.ball.pose.p
         goal_pos = env.goal_region.pose.p
         roll_direction = self._compute_roll_direction(ball_pos, goal_pos)
+        ball_forward_speed = torch.sum(
+            env.ball.linear_velocity[:, :2] * roll_direction[:, :2], dim=1
+        )
         tcp_hit_pos = ball_pos - roll_direction * (env.ball_radius + 0.05)
         tcp_to_hit_dist = torch.linalg.norm(
             env.agent.tcp.pose.p - tcp_hit_pos, dim=1
@@ -73,6 +79,10 @@ class RollBallSkillFSM:
         signals = {
             "success": info["success"],
             "reached_hit_pose": tcp_to_hit_dist < 0.04,
+            "ball_forward_speed": ball_forward_speed,
+            "is_ball_rolling_toward_goal": (
+                ball_forward_speed > self._BALL_FORWARD_SPEED_THRESHOLD
+            ),
             "tcp_to_hit_dist": tcp_to_hit_dist,
             "ball_to_goal_dist": torch.linalg.norm(
                 ball_pos[:, :2] - goal_pos[:, :2], dim=1
@@ -98,6 +108,7 @@ class RollBallSkillFSM:
         env_idx = self._normalize_env_idx(env_idx)
         signals = self._compute_signals(env, env_idx)
         reached_hit_pose = signals["reached_hit_pose"]
+        is_ball_rolling_toward_goal = signals["is_ball_rolling_toward_goal"]
         success = signals["success"]
 
         if env_idx is None:
@@ -106,9 +117,11 @@ class RollBallSkillFSM:
             phase = self.phase[env_idx].clone()
 
         align = phase == int(RollBallSkillPhase.ALIGN)
-        roll = phase == int(RollBallSkillPhase.ROLL)
-        phase[align & reached_hit_pose] = int(RollBallSkillPhase.ROLL)
-        phase[roll & success] = int(RollBallSkillPhase.DONE)
+        hit = phase == int(RollBallSkillPhase.HIT)
+        coast = phase == int(RollBallSkillPhase.COAST)
+        phase[align & reached_hit_pose] = int(RollBallSkillPhase.HIT)
+        phase[hit & is_ball_rolling_toward_goal] = int(RollBallSkillPhase.COAST)
+        phase[coast & success] = int(RollBallSkillPhase.DONE)
 
         if env_idx is None:
             self.phase.copy_(phase)
@@ -121,12 +134,14 @@ class RollBallSkillFSM:
         phase = phase.reshape(-1)
 
         align = phase == int(RollBallSkillPhase.ALIGN)
-        roll = phase == int(RollBallSkillPhase.ROLL)
+        hit = phase == int(RollBallSkillPhase.HIT)
+        coast = phase == int(RollBallSkillPhase.COAST)
         done = phase == int(RollBallSkillPhase.DONE)
 
         skill_id = torch.full_like(phase, SKILL_IDS["none"])
         skill_id[align] = SKILL_IDS["push"]
-        skill_id[roll] = SKILL_IDS["push"]
+        skill_id[hit] = SKILL_IDS["push"]
+        skill_id[coast] = SKILL_IDS["push"]
 
         ball_pos = self._select(env.ball.pose.p, env_idx).reshape(-1, 3)
         goal_pos = self._select(env.goal_region.pose.p, env_idx).reshape(-1, 3)
@@ -134,43 +149,47 @@ class RollBallSkillFSM:
         roll_direction = self._compute_roll_direction(ball_pos, goal_pos)
         offset = env.ball_radius + 0.05
 
-        align_target_pos = ball_pos - roll_direction * offset
-        roll_target_pos = ball_pos.clone()
-        roll_target_pos[:, :2] = goal_pos[:, :2] - roll_direction[:, :2] * offset
-        align_target_pose = Pose.create_from_pq(p=align_target_pos, q=tcp_pose.q)
-        roll_target_pose = Pose.create_from_pq(p=roll_target_pos, q=tcp_pose.q)
+        tcp_hit_target_pos = ball_pos - roll_direction * offset
+        tcp_hit_target_pose = Pose.create_from_pq(p=tcp_hit_target_pos, q=tcp_pose.q)
 
-        target_pose_world = torch.where(
-            roll[:, None, None],
-            roll_target_pose.to_transformation_matrix(),
-            align_target_pose.to_transformation_matrix(),
-        )
-        target_pose_world[done] = float("nan")
+        target_pose_world = tcp_hit_target_pose.to_transformation_matrix()
+        target_pose_world[coast | done] = float("nan")
         target_point_world = target_pose_world[:, :3, 3].clone()
 
         target_gripper_width = torch.zeros(
             phase.shape, dtype=torch.float32, device=phase.device
         )
-        target_gripper_width[done] = float("nan")
+        target_gripper_width[coast | done] = float("nan")
 
         phase_names_by_id = {
             int(RollBallSkillPhase.ALIGN): "align",
-            int(RollBallSkillPhase.ROLL): "roll",
+            int(RollBallSkillPhase.HIT): "hit",
+            int(RollBallSkillPhase.COAST): "coast",
             int(RollBallSkillPhase.DONE): "done",
         }
         skill_names_by_phase_id = {
             int(RollBallSkillPhase.ALIGN): "push",
-            int(RollBallSkillPhase.ROLL): "push",
+            int(RollBallSkillPhase.HIT): "push",
+            int(RollBallSkillPhase.COAST): "push",
             int(RollBallSkillPhase.DONE): "none",
         }
         skill_states_by_phase_id = {
             int(RollBallSkillPhase.ALIGN): "move_tcp_behind_ball",
-            int(RollBallSkillPhase.ROLL): "roll_ball_to_goal",
+            int(RollBallSkillPhase.HIT): "hit_ball_toward_goal",
+            int(RollBallSkillPhase.COAST): "wait_for_ball_to_reach_goal",
             int(RollBallSkillPhase.DONE): "task_done",
         }
         phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
         target_objects = [
-            None if x == int(RollBallSkillPhase.DONE) else "tcp"
+            (
+                None
+                if x
+                in (
+                    int(RollBallSkillPhase.COAST),
+                    int(RollBallSkillPhase.DONE),
+                )
+                else "tcp"
+            )
             for x in phase_ids
         ]
 
@@ -181,6 +200,10 @@ class RollBallSkillFSM:
             "target_entity": "tcp",
             "success": signals["success"],
             "reached_hit_pose": signals["reached_hit_pose"],
+            "ball_forward_speed": signals["ball_forward_speed"],
+            "is_ball_rolling_toward_goal": signals[
+                "is_ball_rolling_toward_goal"
+            ],
             "tcp_to_hit_dist": signals["tcp_to_hit_dist"],
             "ball_to_goal_dist": signals["ball_to_goal_dist"],
             "roll_direction_world": signals["roll_direction_world"],
@@ -198,6 +221,7 @@ class RollBallSkillFSM:
             target_gripper_width=target_gripper_width,
             active_object=["ball"] * len(phase_ids),
             target_object=target_objects,
+            allow_no_target=coast,
             task_meta=task_meta,
         )
 
