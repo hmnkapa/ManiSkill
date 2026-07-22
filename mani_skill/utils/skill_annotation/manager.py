@@ -165,7 +165,9 @@ class SkillAnnotationManager:
         device = context.skill_id.device
         effective = make_empty_normalized_context(context.num_envs, device=device)
         used_previous = torch.zeros((context.num_envs,), device=device, dtype=torch.bool)
-        current_valid = (context.skill_id != 0) & context.has_target
+        current_valid = (context.skill_id != 0) & (
+            context.has_target | context.allow_no_target
+        )
 
         for row, env_idx in enumerate(env_indices):
             if bool(current_valid[row].item()):
@@ -286,6 +288,7 @@ def _write_context_row(
     dst.target_gripper_width_valid[dst_row] = src.target_gripper_width_valid[src_row]
     dst.active_object[dst_row] = src.active_object[src_row]
     dst.target_object[dst_row] = src.target_object[src_row]
+    dst.allow_no_target[dst_row] = src.allow_no_target[src_row]
     dst.task_meta.update(src.task_meta)
 
 

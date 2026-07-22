@@ -255,6 +255,34 @@ def test_manager_previous_cache_falls_back_when_target_is_missing():
     assert no_fallback["target"]["point_valid"].tolist() == [False]
 
 
+def test_manager_preserves_explicit_targetless_annotation():
+    env = _ContextSequenceEnv(
+        [
+            SkillAnnotationContext(
+                skill="push",
+                phase_id=2,
+                phase="coast",
+                skill_state="wait_for_ball_to_reach_goal",
+                active_object="ball",
+                allow_no_target=True,
+            )
+        ]
+    )
+
+    bundle = get_annotation_bundle(env)
+
+    assert bundle["skill"] == ["push"]
+    assert bundle["skill_id"].tolist() == [SKILL_IDS["push"]]
+    assert bundle["phase_id"].tolist() == [2]
+    assert bundle["phase"] == ["coast"]
+    assert bundle["skill_state"] == ["wait_for_ball_to_reach_goal"]
+    assert bundle["target"]["point_valid"].tolist() == [False]
+    assert bundle["target"]["pose_valid"].tolist() == [False]
+    assert bundle["target"]["gripper_width_valid"].tolist() == [False]
+    assert bundle["debug"]["current_valid"].tolist() == [True]
+    assert bundle["debug"]["used_previous"].tolist() == [False]
+
+
 def test_pick_cube_style_context_shapes_for_grasp_and_not_grasp():
     env = _PickCubeStyleProviderEnv()
 
@@ -284,7 +312,7 @@ def test_pick_cube_style_context_shapes_for_grasp_and_not_grasp():
         assert single["task_meta"] == {"task": "PickCube-style"}
 
 
-def test_place_sphere_skill_fsm_transitions_wait_for_bin_settle():
+def test_place_sphere_skill_fsm_transitions_through_release_and_settle():
     env = _PlaceSphereFSMEnv()
     fsm = PlaceSphereSkillFSM(num_envs=1, device="cpu")
 
@@ -294,23 +322,176 @@ def test_place_sphere_skill_fsm_transitions_wait_for_bin_settle():
     fsm.update(env)
     assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.PLACE)]
 
-    env.set_info(is_obj_grasped=False, is_obj_on_bin=True, success=False)
+    env.set_info(
+        is_obj_grasped=False,
+        is_obj_on_bin=False,
+        is_obj_static=False,
+        success=False,
+    )
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.RELEASE)]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.RELEASE)]
+
+    env.set_info(is_obj_grasped=True)
     fsm.update(env)
     assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.PLACE)]
 
-    env.set_info(is_obj_grasped=False, is_obj_on_bin=False, success=False)
+    env.set_info(
+        is_obj_grasped=False,
+        is_obj_on_bin=True,
+        is_obj_static=False,
+        success=False,
+    )
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.RELEASE)]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.RELEASE)]
+
+    env.set_info(
+        is_obj_grasped=False,
+        is_obj_on_bin=False,
+        is_obj_static=True,
+        success=False,
+    )
     fsm.update(env)
     assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.PICK)]
 
     env.set_info(is_obj_grasped=True)
     fsm.update(env)
-    env.set_info(is_obj_grasped=False, is_obj_on_bin=True, success=True)
+    env.set_info(
+        is_obj_grasped=False,
+        is_obj_on_bin=True,
+        is_obj_static=True,
+        success=True,
+    )
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.RELEASE)]
+
     fsm.update(env)
     assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.DONE)]
 
-    env.set_info(is_obj_grasped=False, is_obj_on_bin=False, success=False)
+    env.set_info(
+        is_obj_grasped=False,
+        is_obj_on_bin=False,
+        is_obj_static=True,
+        success=False,
+    )
     fsm.update(env)
     assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.DONE)]
+
+
+def test_place_sphere_release_context_and_partial_update():
+    env = _PlaceSphereFSMEnv(num_envs=2)
+    fsm = PlaceSphereSkillFSM(num_envs=2, device="cpu")
+    fsm.phase.copy_(
+        torch.tensor(
+            [
+                int(PlaceSphereSkillPhase.PLACE),
+                int(PlaceSphereSkillPhase.RELEASE),
+            ],
+            dtype=torch.long,
+        )
+    )
+
+    context = fsm.build_context(env)
+    normalized = normalize_skill_context(context, num_envs=2, device="cpu")
+    assert context.skill == ["place", "place"]
+    assert context.phase == ["place", "release"]
+    assert context.skill_state == ["move_to_bin", "wait_for_sphere_to_settle"]
+    assert normalized.skill_id.tolist() == [SKILL_IDS["place"], SKILL_IDS["place"]]
+    assert normalized.phase_id.tolist() == [
+        int(PlaceSphereSkillPhase.PLACE),
+        int(PlaceSphereSkillPhase.RELEASE),
+    ]
+    assert normalized.target_pose_valid.tolist() == [True, True]
+    assert normalized.target_point_valid.tolist() == [True, True]
+    assert context.target_gripper_width is None
+    assert context.active_object == ["sphere", "sphere"]
+    assert normalized.target_object == ["tcp", "tcp"]
+    assert torch.allclose(
+        normalized.target_point_world,
+        normalized.target_pose_world[:, :3, 3],
+    )
+
+    selected = fsm.build_context(env, env_idx=[1])
+    assert selected.phase_id.tolist() == [int(PlaceSphereSkillPhase.RELEASE)]
+    assert selected.phase == ["release"]
+    assert selected.skill == ["place"]
+    assert selected.skill_state == ["wait_for_sphere_to_settle"]
+    assert selected.target_object == ["tcp"]
+    selected_target_pose = normalize_skill_context(
+        selected, num_envs=1, device="cpu"
+    ).target_pose_world.clone()
+
+    env.obj.set_pose(
+        torch.tensor(
+            [[0.0, 0.0, -0.01], [0.0, 0.0, -0.03]], dtype=torch.float32
+        )
+    )
+    selected_after_fall = normalize_skill_context(
+        fsm.build_context(env, env_idx=[1]), num_envs=1, device="cpu"
+    )
+    assert torch.allclose(selected_after_fall.target_pose_world, selected_target_pose)
+
+    fsm.phase.fill_(int(PlaceSphereSkillPhase.PLACE))
+    env.set_info(is_obj_grasped=[True, False])
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PlaceSphereSkillPhase.PLACE),
+        int(PlaceSphereSkillPhase.RELEASE),
+    ]
+
+    fsm.reset(env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PlaceSphereSkillPhase.PLACE),
+        int(PlaceSphereSkillPhase.PICK),
+    ]
+    assert fsm._cached_place_target_pose_valid.tolist() == [True, False]
+    assert torch.isfinite(fsm._cached_place_target_pose_world[0]).all()
+    assert torch.isnan(fsm._cached_place_target_pose_world[1]).all()
+
+
+def test_place_sphere_release_target_is_frozen_until_regrasp():
+    env = _PlaceSphereFSMEnv()
+    fsm = PlaceSphereSkillFSM(num_envs=1, device="cpu")
+
+    env.set_info(is_obj_grasped=True)
+    fsm.update(env)
+    place_context = normalize_skill_context(
+        fsm.build_context(env), num_envs=1, device="cpu"
+    )
+    last_place_target = place_context.target_pose_world.clone()
+
+    env.obj.set_pose(torch.tensor([[0.0, 0.0, -0.02]], dtype=torch.float32))
+    env.set_info(is_obj_grasped=False, is_obj_static=False, success=False)
+    fsm.update(env)
+    release_context = normalize_skill_context(
+        fsm.build_context(env), num_envs=1, device="cpu"
+    )
+    assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.RELEASE)]
+    assert torch.allclose(release_context.target_pose_world, last_place_target)
+
+    env.obj.set_pose(torch.tensor([[0.0, 0.0, -0.04]], dtype=torch.float32))
+    falling_context = normalize_skill_context(
+        fsm.build_context(env), num_envs=1, device="cpu"
+    )
+    assert torch.allclose(falling_context.target_pose_world, last_place_target)
+
+    env.set_info(is_obj_grasped=True)
+    fsm.update(env)
+    regrasp_context = normalize_skill_context(
+        fsm.build_context(env), num_envs=1, device="cpu"
+    )
+    assert fsm.phase.tolist() == [int(PlaceSphereSkillPhase.PLACE)]
+    assert not torch.allclose(regrasp_context.target_pose_world, last_place_target)
+    assert torch.allclose(
+        regrasp_context.target_point_world,
+        torch.tensor([[0.0, 0.0, 0.2925]], dtype=torch.float32),
+        atol=1e-5,
+    )
 
 
 def test_stack_cube_skill_fsm_transitions_wait_for_cube_settle():
@@ -456,6 +637,10 @@ def test_pull_cube_tool_skill_fsm_transitions_through_pull():
     assert context.phase == ["align"]
     assert context.skill_state == ["position_hook_behind_cube"]
     assert context.target_object == ["tcp"]
+    assert torch.allclose(
+        context.target_point_world,
+        torch.tensor([[0.13, -0.067, 0.025]], dtype=torch.float32),
+    )
 
     fsm.update(env)
     assert fsm.phase.tolist() == [int(PullCubeToolSkillPhase.ALIGN)]
@@ -467,6 +652,16 @@ def test_pull_cube_tool_skill_fsm_transitions_through_pull():
     assert context.skill_id.tolist() == [SKILL_IDS["push"]]
     assert context.phase == ["pull"]
     assert context.skill_state == ["pull_cube_into_workspace"]
+    assert torch.allclose(
+        context.target_point_world,
+        torch.tensor([[-0.22, -0.067, 0.025]], dtype=torch.float32),
+    )
+
+    fixed_pull_target = context.target_pose_world.clone()
+    env.cube.set_pose(env.cube.pose.p + torch.tensor([[0.1, 0.03, 0.0]]))
+    env.agent.set_tcp_pos(env.agent.tcp.pose.p + torch.tensor([[-0.1, 0.0, 0.0]]))
+    context = fsm.build_context(env)
+    assert torch.allclose(context.target_pose_world, fixed_pull_target)
 
     env.set_info(success=True)
     fsm.update(env)
@@ -476,6 +671,37 @@ def test_pull_cube_tool_skill_fsm_transitions_through_pull():
     env.set_info(success=False)
     fsm.update(env)
     assert fsm.phase.tolist() == [int(PullCubeToolSkillPhase.DONE)]
+
+
+def test_pull_cube_tool_skill_fsm_latches_pull_target_for_selected_envs():
+    env = _PullCubeToolFSMEnv(num_envs=2)
+    fsm = PullCubeToolSkillFSM(num_envs=2, device="cpu")
+
+    env.set_tool_grasped([True, True])
+    fsm.update(env)
+    env.set_tool_positioned([False, True])
+    fsm.update(env, env_idx=[1])
+
+    assert fsm.phase.tolist() == [
+        int(PullCubeToolSkillPhase.ALIGN),
+        int(PullCubeToolSkillPhase.PULL),
+    ]
+    assert torch.isnan(fsm.pull_target_pos[0]).all()
+    assert torch.allclose(
+        fsm.pull_target_pos[1],
+        torch.tensor([-0.22, -0.067, 0.025], dtype=torch.float32),
+    )
+
+    fixed_pull_target = fsm.build_context(env, env_idx=[1]).target_pose_world.clone()
+    env.cube.set_pose(env.cube.pose.p + torch.tensor([[0.2, 0.0, 0.0]]))
+    assert torch.allclose(
+        fsm.build_context(env, env_idx=[1]).target_pose_world,
+        fixed_pull_target,
+    )
+
+    fsm.reset(env_idx=[1])
+    assert torch.isnan(fsm.pull_target_pos[1]).all()
+    assert torch.isnan(fsm.pull_target_q[1]).all()
 
 
 def test_push_cube_skill_fsm_transitions_through_push():
@@ -532,7 +758,7 @@ def test_pull_cube_skill_fsm_transitions_through_pull():
     assert fsm.phase.tolist() == [int(PullCubeSkillPhase.DONE)]
 
 
-def test_roll_ball_skill_fsm_transitions_through_roll_without_reached_status():
+def test_roll_ball_skill_fsm_transitions_through_hit_and_coast():
     env = _RollBallFSMEnv()
     fsm = RollBallSkillFSM(num_envs=1, device="cpu")
 
@@ -543,14 +769,42 @@ def test_roll_ball_skill_fsm_transitions_through_roll_without_reached_status():
 
     env.move_tcp_to_hit_pose()
     fsm.update(env)
-    assert fsm.phase.tolist() == [int(RollBallSkillPhase.ROLL)]
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.HIT)]
     context = fsm.build_context(env)
     assert context.skill_id.tolist() == [SKILL_IDS["push"]]
-    assert context.phase == ["roll"]
-    assert context.skill_state == ["roll_ball_to_goal"]
+    assert context.phase == ["hit"]
+    assert context.skill_state == ["hit_ball_toward_goal"]
     assert context.target_object == ["tcp"]
 
     env.reached_status.fill_(0.0)
+    env.set_ball_velocity([0.0, -0.1, 0.0])
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.HIT)]
+
+    env.set_ball_velocity([0.0, 0.5, 0.0])
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.HIT)]
+
+    env.set_ball_velocity([0.0, -0.2, 0.0])
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.COAST)]
+    context = fsm.build_context(env)
+    normalized = normalize_skill_context(context, num_envs=1, device="cpu")
+    assert context.skill_id.tolist() == [SKILL_IDS["push"]]
+    assert context.phase == ["coast"]
+    assert context.skill_state == ["wait_for_ball_to_reach_goal"]
+    assert context.target_object == [None]
+    assert torch.isnan(context.target_pose_world).all()
+    assert torch.isnan(context.target_point_world).all()
+    assert torch.isnan(context.target_gripper_width).all()
+    assert normalized.target_pose_valid.tolist() == [False]
+    assert normalized.target_point_valid.tolist() == [False]
+    assert normalized.target_gripper_width_valid.tolist() == [False]
+    assert normalized.allow_no_target.tolist() == [True]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(RollBallSkillPhase.COAST)]
+
     env.set_info(success=True)
     fsm.update(env)
     assert fsm.phase.tolist() == [int(RollBallSkillPhase.DONE)]
@@ -560,7 +814,36 @@ def test_roll_ball_skill_fsm_transitions_through_roll_without_reached_status():
     assert fsm.phase.tolist() == [int(RollBallSkillPhase.DONE)]
 
 
-def test_lift_peg_upright_skill_fsm_transitions_to_done():
+def test_roll_ball_skill_fsm_partial_update_uses_selected_ball_velocity():
+    env = _RollBallFSMEnv(num_envs=2)
+    fsm = RollBallSkillFSM(num_envs=2, device="cpu")
+    fsm.phase.fill_(int(RollBallSkillPhase.HIT))
+    env.set_ball_velocity(
+        [
+            [0.0, 0.5, 0.0],
+            [0.0, -0.2, 0.0],
+        ]
+    )
+
+    fsm.update(env, env_idx=[1])
+
+    assert fsm.phase.tolist() == [
+        int(RollBallSkillPhase.HIT),
+        int(RollBallSkillPhase.COAST),
+    ]
+    context = fsm.build_context(env, env_idx=[1])
+    assert context.phase_id.tolist() == [int(RollBallSkillPhase.COAST)]
+    assert context.task_meta["ball_forward_speed"].shape == (1,)
+    assert context.task_meta["is_ball_rolling_toward_goal"].tolist() == [True]
+
+    fsm.reset(env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(RollBallSkillPhase.HIT),
+        int(RollBallSkillPhase.ALIGN),
+    ]
+
+
+def test_lift_peg_upright_skill_fsm_transitions_through_place_stages():
     env = _LiftPegUprightFSMEnv()
     fsm = LiftPegUprightSkillFSM(num_envs=1, device="cpu")
 
@@ -568,15 +851,59 @@ def test_lift_peg_upright_skill_fsm_transitions_to_done():
 
     env.set_grasped(True)
     fsm.update(env)
-    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.PLACE)]
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.LIFT)]
     context = fsm.build_context(env)
     assert context.skill_id.tolist() == [SKILL_IDS["place"]]
-    assert context.phase == ["place"]
-    assert context.skill_state == ["place_peg_upright"]
+    assert context.phase == ["lift"]
+    assert context.skill_state == ["lift_peg_to_safe_height"]
+    assert torch.allclose(context.task_meta["safe_peg_height"], torch.tensor([0.22]))
+    assert torch.allclose(context.task_meta["lift_height_error"], torch.tensor([0.22]))
+    assert context.task_meta["is_lifted"].tolist() == [False]
 
-    env.set_grasped(False)
     fsm.update(env)
-    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.PLACE)]
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.LIFT)]
+
+    env.peg.set_pose(
+        torch.tensor([[0.0, 0.0, 0.22]], dtype=torch.float32),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+    )
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.ROTATE)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["place"]]
+    assert context.phase == ["rotate"]
+    assert context.skill_state == ["rotate_peg_upright"]
+    assert context.task_meta["is_lifted"].tolist() == [True]
+    assert context.task_meta["orientation_aligned"].tolist() == [False]
+    rotate_target_pose = context.target_pose_world.clone()
+    assert torch.allclose(
+        context.target_point_world, env.agent.tcp.pose.p, atol=1e-5
+    )
+
+    env.agent.set_tcp_pos(torch.tensor([[-0.08, 0.02, 0.21]]))
+    env.peg.set_pose(
+        torch.tensor([[0.01, 0.02, 0.21]], dtype=torch.float32),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+    )
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.ROTATE)]
+    context = fsm.build_context(env)
+    assert torch.allclose(context.target_pose_world, rotate_target_pose, atol=1e-5)
+
+    env.peg.set_pose(
+        torch.tensor([[0.0, 0.0, 0.22]], dtype=torch.float32),
+        torch.tensor([[0.5, 0.5, -0.5, 0.5]], dtype=torch.float32),
+    )
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.LOWER)]
+    context = fsm.build_context(env)
+    assert context.skill_id.tolist() == [SKILL_IDS["place"]]
+    assert context.phase == ["lower"]
+    assert context.skill_state == ["lower_peg_to_table"]
+    assert context.task_meta["orientation_aligned"].tolist() == [True]
+
+    fsm.update(env)
+    assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.LOWER)]
 
     env.set_info(success=True)
     fsm.update(env)
@@ -586,13 +913,34 @@ def test_lift_peg_upright_skill_fsm_transitions_to_done():
     fsm.update(env)
     assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.DONE)]
 
+    for active_phase in (
+        LiftPegUprightSkillPhase.LIFT,
+        LiftPegUprightSkillPhase.ROTATE,
+        LiftPegUprightSkillPhase.LOWER,
+    ):
+        fsm.phase.fill_(int(active_phase))
+        env.set_grasped(False)
+        fsm.update(env)
+        assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.PICK)]
+
     env = _LiftPegUprightFSMEnv(num_envs=2)
     fsm = LiftPegUprightSkillFSM(num_envs=2, device="cpu")
     env.set_grasped([False, True])
     fsm.update(env, env_idx=[1])
     assert fsm.phase.tolist() == [
         int(LiftPegUprightSkillPhase.PICK),
-        int(LiftPegUprightSkillPhase.PLACE),
+        int(LiftPegUprightSkillPhase.LIFT),
+    ]
+
+    peg_pos = env.peg.pose.p.clone()
+    peg_pos[1, 2] = 0.22
+    peg_q = env.peg.pose.q.clone()
+    peg_q[1] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    env.peg.set_pose(peg_pos, peg_q)
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(LiftPegUprightSkillPhase.PICK),
+        int(LiftPegUprightSkillPhase.ROTATE),
     ]
 
 
@@ -744,7 +1092,7 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_tcp_target_tasks():
         (
             LiftPegUprightSkillFSM,
             _LiftPegUprightFSMEnv(num_envs=2),
-            [LiftPegUprightSkillPhase.PICK, LiftPegUprightSkillPhase.PLACE],
+            [LiftPegUprightSkillPhase.PICK, LiftPegUprightSkillPhase.LIFT],
             [SKILL_IDS["pick"], SKILL_IDS["place"]],
             "LiftPegUpright-v1",
         ),
@@ -796,7 +1144,7 @@ def test_tabletop_skill_fsm_contexts_normalize_for_all_tcp_target_tasks():
         (
             RollBallSkillFSM,
             _RollBallFSMEnv(num_envs=2),
-            [RollBallSkillPhase.ALIGN, RollBallSkillPhase.ROLL],
+            [RollBallSkillPhase.ALIGN, RollBallSkillPhase.HIT],
             [SKILL_IDS["push"], SKILL_IDS["push"]],
             "RollBall-v1",
         ),
@@ -862,9 +1210,13 @@ def test_tabletop_skill_fsm_tcp_target_geometry_for_every_active_phase():
         ),
         (
             PlaceSphereSkillFSM,
-            _PlaceSphereFSMEnv(num_envs=2),
-            [PlaceSphereSkillPhase.PICK, PlaceSphereSkillPhase.PLACE],
-            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.225]],
+            _PlaceSphereFSMEnv(num_envs=3),
+            [
+                PlaceSphereSkillPhase.PICK,
+                PlaceSphereSkillPhase.PLACE,
+                PlaceSphereSkillPhase.RELEASE,
+            ],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.2525], [0.0, 0.0, 0.2525]],
         ),
         (
             StackCubeSkillFSM,
@@ -900,7 +1252,7 @@ def test_tabletop_skill_fsm_tcp_target_geometry_for_every_active_phase():
                 PullCubeToolSkillPhase.ALIGN,
                 PullCubeToolSkillPhase.PULL,
             ],
-            [[0.02, 0.0, 0.025], [0.03, -0.067, 0.2], [-0.32, -0.067, 0.2]],
+            [[0.02, 0.0, 0.025], [0.13, -0.067, 0.025], [-0.22, -0.067, 0.025]],
         ),
         (
             PushCubeSkillFSM,
@@ -917,8 +1269,8 @@ def test_tabletop_skill_fsm_tcp_target_geometry_for_every_active_phase():
         (
             RollBallSkillFSM,
             _RollBallFSMEnv(num_envs=2),
-            [RollBallSkillPhase.ALIGN, RollBallSkillPhase.ROLL],
-            [[0.0, 0.085, 0.035], [0.0, -0.115, 0.035]],
+            [RollBallSkillPhase.ALIGN, RollBallSkillPhase.HIT],
+            [[0.0, 0.085, 0.035], [0.0, 0.085, 0.035]],
         ),
     ]
 
@@ -957,16 +1309,30 @@ def test_new_task_skill_fsm_tcp_target_geometry_and_task_meta():
     cases = [
         (
             LiftPegUprightSkillFSM,
-            _LiftPegUprightFSMEnv(num_envs=2),
-            [LiftPegUprightSkillPhase.PICK, LiftPegUprightSkillPhase.PLACE],
-            [[0.1, 0.0, 0.0], [-0.1, 0.0, 0.2]],
+            _LiftPegUprightFSMEnv(num_envs=4),
+            [
+                LiftPegUprightSkillPhase.PICK,
+                LiftPegUprightSkillPhase.LIFT,
+                LiftPegUprightSkillPhase.ROTATE,
+                LiftPegUprightSkillPhase.LOWER,
+            ],
+            [
+                [0.1, 0.0, 0.0],
+                [-0.1, 0.0, 0.3],
+                [-0.1, 0.0, 0.2],
+                [-0.1, 0.0, 0.2],
+            ],
             "LiftPegUpright-v1",
             {
                 "success",
                 "is_grasped",
                 "is_peg_upright",
                 "close_to_table",
+                "safe_peg_height",
+                "lift_height_error",
+                "is_lifted",
                 "upright_axis_error",
+                "orientation_aligned",
                 "z_error",
                 "desired_peg_pose_world",
             },
@@ -1066,6 +1432,59 @@ def test_new_task_skill_fsm_tcp_target_geometry_and_task_meta():
                 assert value.shape[0] == 1
             elif isinstance(value, list):
                 assert len(value) == 1
+
+
+def test_lift_peg_upright_place_phase_target_geometry():
+    env = _LiftPegUprightFSMEnv(num_envs=3)
+    peg_pos = torch.tensor(
+        [
+            [0.01, 0.02, 0.025],
+            [0.03, -0.02, 0.22],
+            [-0.04, 0.01, 0.22],
+        ],
+        dtype=torch.float32,
+    )
+    upright_q = torch.tensor([0.5, 0.5, -0.5, 0.5], dtype=torch.float32)
+    peg_q = torch.tensor(
+        [
+            [0.70710677, 0.70710677, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            upright_q.tolist(),
+        ],
+        dtype=torch.float32,
+    )
+    env.peg.set_pose(peg_pos, peg_q)
+
+    fsm = LiftPegUprightSkillFSM(num_envs=3, device="cpu")
+    fsm.phase.copy_(
+        torch.tensor(
+            [
+                int(LiftPegUprightSkillPhase.LIFT),
+                int(LiftPegUprightSkillPhase.ROTATE),
+                int(LiftPegUprightSkillPhase.LOWER),
+            ],
+            dtype=torch.long,
+        )
+    )
+    context = fsm.build_context(env)
+
+    expected_peg_pos = peg_pos.clone()
+    expected_peg_pos[:, 2] = torch.tensor([0.22, 0.22, 0.12])
+    expected_peg_q = peg_q.clone()
+    expected_peg_q[1:] = upright_q
+    expected_peg_pose = Pose.create_from_pq(
+        p=expected_peg_pos, q=expected_peg_q
+    ).to_transformation_matrix()
+    current_peg_pose = env.peg.pose.to_transformation_matrix()
+    current_tcp_pose = env.agent.tcp.pose.to_transformation_matrix()
+    current_grasp_transform = torch.linalg.inv(current_peg_pose) @ current_tcp_pose
+    expected_target_pose = expected_peg_pose @ current_grasp_transform
+    expected_target_pose[1, :3, 3] = current_tcp_pose[1, :3, 3]
+
+    assert torch.allclose(context.target_pose_world, expected_target_pose, atol=1e-5)
+    assert torch.allclose(
+        context.target_point_world, expected_target_pose[:, :3, 3], atol=1e-5
+    )
 
 
 def test_tabletop_skill_fsm_done_has_no_tcp_target():
@@ -1182,11 +1601,13 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
         (
             RollBallSkillFSM,
             _RollBallFSMEnv(num_envs=2),
-            [RollBallSkillPhase.ALIGN, RollBallSkillPhase.ROLL],
+            [RollBallSkillPhase.ALIGN, RollBallSkillPhase.HIT],
             "RollBall-v1",
             {
                 "success",
                 "reached_hit_pose",
+                "ball_forward_speed",
+                "is_ball_rolling_toward_goal",
                 "tcp_to_hit_dist",
                 "ball_to_goal_dist",
                 "roll_direction_world",
@@ -1242,22 +1663,29 @@ def test_requested_task_skill_fsm_gripper_width_semantics():
     assert plug_context.target_gripper_width_valid.tolist() == [True, True, True]
     assert torch.allclose(plug_context.target_gripper_width, torch.zeros(3))
 
-    lift_env = _LiftPegUprightFSMEnv(num_envs=2)
-    lift_fsm = LiftPegUprightSkillFSM(num_envs=2, device="cpu")
+    lift_env = _LiftPegUprightFSMEnv(num_envs=4)
+    lift_fsm = LiftPegUprightSkillFSM(num_envs=4, device="cpu")
     lift_fsm.phase.copy_(
         torch.tensor(
             [
                 int(LiftPegUprightSkillPhase.PICK),
-                int(LiftPegUprightSkillPhase.PLACE),
+                int(LiftPegUprightSkillPhase.LIFT),
+                int(LiftPegUprightSkillPhase.ROTATE),
+                int(LiftPegUprightSkillPhase.LOWER),
             ],
             dtype=torch.long,
         )
     )
     lift_context = normalize_skill_context(
-        lift_fsm.build_context(lift_env), num_envs=2, device="cpu"
+        lift_fsm.build_context(lift_env), num_envs=4, device="cpu"
     )
-    assert lift_context.target_gripper_width_valid.tolist() == [False, True]
-    assert lift_context.target_gripper_width.tolist() == [0.0, 0.0]
+    assert lift_context.target_gripper_width_valid.tolist() == [
+        False,
+        True,
+        True,
+        True,
+    ]
+    assert lift_context.target_gripper_width.tolist() == [0.0, 0.0, 0.0, 0.0]
 
     stack_env = _StackPyramidFSMEnv(num_envs=3)
     stack_fsm = StackPyramidSkillFSM(num_envs=3, device="cpu")
@@ -1900,16 +2328,16 @@ class _PullCubeToolFSMEnv:
         self.agent.is_grasped = _bool_tensor(is_grasped, self.num_envs)
 
     def set_tool_positioned(self, positioned):
-        if positioned:
-            tool_pos = self.cube.pose.p + torch.tensor(
-                [-(self.hook_length + self.cube_half_size), -0.067, 0],
-                dtype=torch.float32,
-            )
-        else:
-            tool_pos = torch.tensor([[0.0, 0.0, 0.025]], dtype=torch.float32).repeat(
-                self.num_envs, 1
-            )
-        self.l_shape_tool = _ActorStub(tool_pos, self.l_shape_tool.pose.q)
+        positioned = _bool_tensor(positioned, self.num_envs)
+        align_target = self.cube.pose.p + torch.tensor(
+            [-(self.hook_length + self.cube_half_size), -0.067, 0],
+            dtype=torch.float32,
+        )
+        default_tcp_pos = torch.tensor(
+            [[-0.1, 0.0, 0.2]], dtype=torch.float32
+        ).repeat(self.num_envs, 1)
+        tcp_pos = torch.where(positioned[:, None], align_target, default_tcp_pos)
+        self.agent.set_tcp_pos(tcp_pos)
 
     def evaluate(self):
         return {key: value.clone() for key, value in self._info.items()}
@@ -1990,6 +2418,9 @@ class _RollBallFSMEnv:
                 num_envs, 1
             )
         )
+        self.ball.linear_velocity = torch.zeros(
+            (num_envs, 3), dtype=torch.float32
+        )
         self.goal_region = _ActorStub(
             torch.tensor([[0.0, -0.2, 0.001]], dtype=torch.float32).repeat(
                 num_envs, 1
@@ -2001,6 +2432,12 @@ class _RollBallFSMEnv:
 
     def set_info(self, success=False):
         self._info = {"success": _bool_tensor(success, self.num_envs)}
+
+    def set_ball_velocity(self, velocity):
+        velocity = torch.as_tensor(velocity, dtype=torch.float32).reshape(-1, 3)
+        if velocity.shape[0] == 1:
+            velocity = velocity.repeat(self.num_envs, 1)
+        self.ball.linear_velocity = velocity
 
     def move_tcp_to_hit_pose(self):
         direction_xy = self.goal_region.pose.p[:, :2] - self.ball.pose.p[:, :2]

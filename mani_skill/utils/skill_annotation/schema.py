@@ -64,6 +64,7 @@ class SkillAnnotationContext:
     target_gripper_width: torch.Tensor | None = None
     active_object: str | list[str] | None = None
     target_object: str | list[str] | None = None
+    allow_no_target: torch.Tensor | bool | list[bool] = False
     task_meta: dict[str, Any] = field(default_factory=dict)
 
 
@@ -82,6 +83,7 @@ class NormalizedSkillAnnotationContext:
     target_gripper_width_valid: torch.Tensor
     active_object: list[Optional[str]]
     target_object: list[Optional[str]]
+    allow_no_target: torch.Tensor
     task_meta: dict[str, Any]
 
     @property
@@ -134,6 +136,9 @@ def normalize_skill_context(
     phase = _normalize_optional_string_list(context.phase, n, "phase")
     active_object = _normalize_optional_string_list(context.active_object, n, "active_object")
     target_object = _normalize_optional_string_list(context.target_object, n, "target_object")
+    allow_no_target = _normalize_bool_mask(
+        context.allow_no_target, n, device, "allow_no_target"
+    )
     point_world, point_valid = _normalize_point(context.target_point_world, n, device)
     pose_world, pose_valid = _normalize_pose(context.target_pose_world, n, device)
     gripper_width, gripper_width_valid = _normalize_gripper_width(
@@ -154,6 +159,7 @@ def normalize_skill_context(
         target_gripper_width_valid=gripper_width_valid,
         active_object=active_object,
         target_object=target_object,
+        allow_no_target=allow_no_target,
         task_meta=dict(context.task_meta or {}),
     )
 
@@ -189,6 +195,7 @@ def select_normalized_context(
         target_gripper_width_valid=context.target_gripper_width_valid[index_tensor].clone(),
         active_object=[context.active_object[i] for i in index_list],
         target_object=[context.target_object[i] for i in index_list],
+        allow_no_target=context.allow_no_target[index_tensor].clone(),
         task_meta=dict(context.task_meta),
     )
 
@@ -211,6 +218,7 @@ def _infer_device(context: SkillAnnotationContext) -> torch.device:
         context.target_point_world,
         context.target_pose_world,
         context.target_gripper_width,
+        context.allow_no_target,
     ):
         if isinstance(value, Pose):
             return value.device
@@ -255,6 +263,12 @@ def _infer_num_envs(context: SkillAnnotationContext) -> int:
     if context.target_gripper_width is not None:
         width = torch.as_tensor(context.target_gripper_width)
         candidates.append(1 if width.ndim == 0 else int(width.reshape(-1).shape[0]))
+    allow_no_target = torch.as_tensor(context.allow_no_target)
+    candidates.append(
+        1
+        if allow_no_target.ndim == 0
+        else int(allow_no_target.reshape(-1).shape[0])
+    )
     return max(candidates) if candidates else 1
 
 
@@ -318,6 +332,18 @@ def _normalize_optional_string_list(
     return _broadcast_list(
         [None if item is None else str(item) for item in value], num_envs, name
     )
+
+
+def _normalize_bool_mask(
+    value: torch.Tensor | bool | Sequence[bool],
+    num_envs: int,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    mask = torch.as_tensor(value, device=device, dtype=torch.bool).reshape(-1)
+    if mask.numel() == 0:
+        raise ValueError(f"{name} cannot be empty")
+    return _broadcast_first_dim(mask, num_envs, name)
 
 
 def _broadcast_list(values: list[Any], num_envs: int, name: str) -> list[Any]:
