@@ -29,7 +29,8 @@ from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 class PlaceSphereSkillPhase(IntEnum):
     PICK = 0
     PLACE = 1
-    DONE = 2
+    RELEASE = 2
+    DONE = 3
 
 
 class PlaceSphereSkillFSM:
@@ -39,6 +40,15 @@ class PlaceSphereSkillFSM:
             int(PlaceSphereSkillPhase.PICK),
             dtype=torch.long,
             device=device,
+        )
+        self._cached_place_target_pose_world = torch.full(
+            (num_envs, 4, 4),
+            float("nan"),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._cached_place_target_pose_valid = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
         )
 
     def _normalize_env_idx(self, env_idx=None):
@@ -60,14 +70,19 @@ class PlaceSphereSkillFSM:
         env_idx = self._normalize_env_idx(env_idx)
         if env_idx is None:
             self.phase.fill_(int(PlaceSphereSkillPhase.PICK))
+            self._cached_place_target_pose_world.fill_(float("nan"))
+            self._cached_place_target_pose_valid.fill_(False)
         else:
             self.phase[env_idx] = int(PlaceSphereSkillPhase.PICK)
+            self._cached_place_target_pose_world[env_idx] = float("nan")
+            self._cached_place_target_pose_valid[env_idx] = False
 
     def update(self, env, env_idx=None):
         env_idx = self._normalize_env_idx(env_idx)
         info = env.evaluate()
         is_grasped = info["is_obj_grasped"]
         is_on_bin = info["is_obj_on_bin"]
+        is_static = info["is_obj_static"]
         success = info["success"]
 
         if env_idx is None:
@@ -76,15 +91,29 @@ class PlaceSphereSkillFSM:
             phase = self.phase[env_idx].clone()
             is_grasped = is_grasped[env_idx]
             is_on_bin = is_on_bin[env_idx]
+            is_static = is_static[env_idx]
             success = success[env_idx]
 
         pick = phase == int(PlaceSphereSkillPhase.PICK)
         place = phase == int(PlaceSphereSkillPhase.PLACE)
+        release = phase == int(PlaceSphereSkillPhase.RELEASE)
         phase[pick & is_grasped] = int(PlaceSphereSkillPhase.PLACE)
-        phase[place & success] = int(PlaceSphereSkillPhase.DONE)
-        phase[place & ~is_grasped & ~is_on_bin & ~success] = int(
-            PlaceSphereSkillPhase.PICK
+        phase[place & ~is_grasped] = int(PlaceSphereSkillPhase.RELEASE)
+        phase[release & success] = int(PlaceSphereSkillPhase.DONE)
+        phase[release & is_grasped & ~success] = int(PlaceSphereSkillPhase.PLACE)
+        release_failed = (
+            release & ~is_grasped & ~is_on_bin & is_static & ~success
         )
+        phase[release_failed] = int(PlaceSphereSkillPhase.PICK)
+
+        selected_env_idx = (
+            torch.arange(self.phase.shape[0], device=self.phase.device)
+            if env_idx is None
+            else env_idx
+        )
+        failed_env_idx = selected_env_idx[release_failed]
+        self._cached_place_target_pose_world[failed_env_idx] = float("nan")
+        self._cached_place_target_pose_valid[failed_env_idx] = False
 
         if env_idx is None:
             self.phase.copy_(phase)
@@ -98,11 +127,13 @@ class PlaceSphereSkillFSM:
 
         pick = phase == int(PlaceSphereSkillPhase.PICK)
         place = phase == int(PlaceSphereSkillPhase.PLACE)
+        release = phase == int(PlaceSphereSkillPhase.RELEASE)
         done = phase == int(PlaceSphereSkillPhase.DONE)
+        place_active = place | release
 
         skill_id = torch.full_like(phase, SKILL_IDS["none"])
         skill_id[pick] = SKILL_IDS["pick"]
-        skill_id[place] = SKILL_IDS["place"]
+        skill_id[place_active] = SKILL_IDS["place"]
 
         obj_pose = Pose.create(self._select(env.obj.pose.raw_pose, env_idx))
         tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
@@ -111,18 +142,42 @@ class PlaceSphereSkillFSM:
             tcp_pose=tcp_pose,
         )
 
-        bin_top_pos = self._select(env.bin.pose.p, env_idx).reshape(-1, 3).clone()
-        bin_top_pos[:, 2] = bin_top_pos[:, 2] + env.block_half_size[0] + env.radius
-        desired_obj_pose = Pose.create_from_pq(p=bin_top_pos, q=obj_pose.q)
+        release_obj_pos = self._select(env.bin.pose.p, env_idx).reshape(-1, 3).clone()
+        release_obj_pos[:, 2] = (
+            release_obj_pos[:, 2] + 2 * env.block_half_size[2]
+        )
+        desired_obj_pose = Pose.create_from_pq(p=release_obj_pos, q=obj_pose.q)
         place_target_pose = target_tcp_pose_from_object_goal(
             current_tcp_pose=tcp_pose,
             current_object_pose=obj_pose,
             desired_object_pose=desired_obj_pose,
         )
+        place_target_pose_world = place_target_pose.to_transformation_matrix()
+
+        # The object-to-TCP transform is only rigid while grasped. Keep refreshing
+        # the target in PLACE, then freeze the last value while the sphere falls.
+        selected_env_idx = (
+            torch.arange(self.phase.shape[0], device=self.phase.device)
+            if env_idx is None
+            else env_idx
+        )
+        cached_target_valid = self._cached_place_target_pose_valid[selected_env_idx]
+        cache_target = place | (release & ~cached_target_valid)
+        cache_env_idx = selected_env_idx[cache_target]
+        self._cached_place_target_pose_world[cache_env_idx] = (
+            place_target_pose_world[cache_target]
+        )
+        self._cached_place_target_pose_valid[cache_env_idx] = True
+
+        active_place_target_pose_world = torch.where(
+            release[:, None, None],
+            self._cached_place_target_pose_world[selected_env_idx],
+            place_target_pose_world,
+        )
 
         target_pose_world = torch.where(
-            place[:, None, None],
-            place_target_pose.to_transformation_matrix(),
+            place_active[:, None, None],
+            active_place_target_pose_world,
             pick_target_pose.to_transformation_matrix(),
         )
         target_pose_world[done] = float("nan")
@@ -131,16 +186,19 @@ class PlaceSphereSkillFSM:
         phase_names_by_id = {
             int(PlaceSphereSkillPhase.PICK): "pick",
             int(PlaceSphereSkillPhase.PLACE): "place",
+            int(PlaceSphereSkillPhase.RELEASE): "release",
             int(PlaceSphereSkillPhase.DONE): "done",
         }
         skill_names_by_phase_id = {
             int(PlaceSphereSkillPhase.PICK): "pick",
             int(PlaceSphereSkillPhase.PLACE): "place",
+            int(PlaceSphereSkillPhase.RELEASE): "place",
             int(PlaceSphereSkillPhase.DONE): "none",
         }
         skill_states_by_phase_id = {
             int(PlaceSphereSkillPhase.PICK): "move_to_sphere",
             int(PlaceSphereSkillPhase.PLACE): "move_to_bin",
+            int(PlaceSphereSkillPhase.RELEASE): "wait_for_sphere_to_settle",
             int(PlaceSphereSkillPhase.DONE): "task_done",
         }
         phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
