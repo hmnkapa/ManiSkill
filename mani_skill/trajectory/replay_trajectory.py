@@ -114,6 +114,27 @@ def sanity_check_and_format_seed(episode):
         episode["reset_kwargs"]["seed"] = episode["episode_seed"]
 
 
+def _replace_last_recorded_frame(recorded, replacement):
+    if isinstance(recorded, np.ndarray):
+        recorded[-1, :] = replacement[-1, :]
+        return
+    for key in recorded:
+        _replace_last_recorded_frame(recorded[key], replacement[key])
+
+
+def _sync_recorded_initial_frame(env: RecordEpisode, initial_env_state) -> None:
+    """Synchronize the saved reset frame after replay injects a source state."""
+    _replace_last_recorded_frame(
+        env._trajectory_buffer.state, common.batch(initial_env_state)
+    )
+    _replace_last_recorded_frame(
+        env._trajectory_buffer.observation,
+        common.to_numpy(common.batch(env.base_env.get_obs())),
+    )
+    if env._skill_annotation_recorder is not None:
+        env._skill_annotation_recorder.reset(env.base_env)
+
+
 def replay_parallelized_sim(
     args: Args, env: RecordEpisode, pbar, episodes, trajectories
 ):
@@ -193,22 +214,7 @@ def replay_parallelized_sim(
             # set the first environment state to the first states in the trajectories given
             env.base_env.set_state_dict(env_states_batch[0])
             if args.save_traj:
-                # replace the first saved env state
-                # since we set state earlier and RecordEpisode will save the reset to state.
-                def recursive_replace(x, y):
-                    if isinstance(x, np.ndarray):
-                        x[-1, :] = y[-1, :]
-                    else:
-                        for k in x.keys():
-                            recursive_replace(x[k], y[k])
-
-                recursive_replace(
-                    env._trajectory_buffer.state, common.batch(env_states_batch[0])
-                )
-                recursive_replace(
-                    env._trajectory_buffer.observation,
-                    common.to_numpy(common.batch(env.base_env.get_obs())),
-                )
+                _sync_recorded_initial_frame(env, env_states_batch[0])
 
         # replay with env states / actions
         if (
@@ -281,28 +287,13 @@ def replay_cpu_sim(
                 ori_env_states = trajectory_utils.dict_to_list_of_dicts(
                     trajectories[traj_id]["env_states"]
                 )
+                initial_env_state = ori_env_states[0]
                 if ori_env is not None:
-                    ori_env.unwrapped.set_state_dict(ori_env_states[0])
-                env.base_env.set_state_dict(ori_env_states[0])
-                ori_env_states = ori_env_states[1:]
+                    ori_env.unwrapped.set_state_dict(initial_env_state)
+                env.base_env.set_state_dict(initial_env_state)
                 if args.save_traj:
-                    # replace the first saved env state
-                    # since we set state earlier and RecordEpisode will save the reset to state.
-                    def recursive_replace(x, y):
-                        if isinstance(x, np.ndarray):
-                            x[-1, :] = y[-1, :]
-                        else:
-                            for k in x.keys():
-                                recursive_replace(x[k], y[k])
-
-                    recursive_replace(
-                        env._trajectory_buffer.state, common.batch(ori_env_states[0])
-                    )
-                    fixed_obs = env.base_env.get_obs()
-                    recursive_replace(
-                        env._trajectory_buffer.observation,
-                        common.to_numpy(common.batch(fixed_obs)),
-                    )
+                    _sync_recorded_initial_frame(env, initial_env_state)
+                ori_env_states = ori_env_states[1:]
             # Original actions to replay
             ori_actions = trajectories[traj_id]["actions"][:]
             info = {}

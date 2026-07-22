@@ -205,8 +205,13 @@ def get_annotation_bundle_for_env(
 
 
 def reset_skill_annotator(env, env_idx: EnvIndex | None = None) -> None:
+    """Reset both cached annotations and any task-local annotation FSM."""
     manager = _get_or_create_manager(env)
     manager.reset(env_idx=env_idx)
+    fsm = getattr(env, "_skill_annotation_fsm", None)
+    reset_fsm = getattr(fsm, "reset", None)
+    if callable(reset_fsm):
+        reset_fsm(env_idx)
 
 
 def get_skill_label(env, env_idx: EnvIndex = 0) -> str:

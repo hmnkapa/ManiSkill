@@ -1780,6 +1780,26 @@ def test_reset_skill_annotator_accepts_supported_env_idx_types():
         assert manager._previous[1] is None
 
 
+def test_reset_skill_annotator_resets_task_annotation_fsm():
+    env = _PickCubeStyleProviderEnv()
+
+    class _FakeSkillFSM:
+        def __init__(self):
+            self.reset_calls = []
+
+        def reset(self, env_idx=None):
+            self.reset_calls.append(env_idx)
+
+    fsm = _FakeSkillFSM()
+    env._skill_annotation_fsm = fsm
+    env_idx = np.array([1])
+
+    reset_skill_annotator(env, env_idx)
+
+    assert len(fsm.reset_calls) == 1
+    np.testing.assert_array_equal(fsm.reset_calls[0], env_idx)
+
+
 def test_skill_annotation_episode_recorder_flushes_t_plus_one_and_projection(tmp_path):
     import h5py
 
