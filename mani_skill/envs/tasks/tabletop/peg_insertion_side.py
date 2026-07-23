@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Any, Union
 
 import numpy as np
@@ -11,6 +12,8 @@ from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.registration import register_env
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
+from mani_skill.utils.skill_annotation.targets import build_panda_topdown_grasp_pose
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs import Actor, Pose
 from mani_skill.utils.structs.types import SimConfig
@@ -45,6 +48,193 @@ def _build_box_with_hole(
         builder.add_box_collision(pose, half_size)
         builder.add_box_visual(pose, half_size, material=mat)
     return builder
+
+
+class PegInsertionSideSkillPhase(IntEnum):
+    PICK = 0
+    PRE_INSERT = 1
+    INSERT = 2
+    DONE = 3
+
+
+class PegInsertionSideSkillFSM:
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(PegInsertionSideSkillPhase.PICK),
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _normalize_env_idx(self, env_idx=None):
+        if env_idx is None:
+            return None
+        if torch.is_tensor(env_idx):
+            return env_idx.to(device=self.phase.device, dtype=torch.long).flatten()
+        return torch.as_tensor(
+            env_idx, device=self.phase.device, dtype=torch.long
+        ).flatten()
+
+    def _select(self, tensor: torch.Tensor, env_idx=None) -> torch.Tensor:
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            return tensor
+        return tensor[env_idx]
+
+    def reset(self, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            self.phase.fill_(int(PegInsertionSideSkillPhase.PICK))
+        else:
+            self.phase[env_idx] = int(PegInsertionSideSkillPhase.PICK)
+
+    def update(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        info = env.evaluate()
+        success = info["success"]
+        is_grasped = env.agent.is_grasping(env.peg, max_angle=20)
+        pre_inserted, _, _ = env.get_peg_pre_insertion_info()
+
+        if env_idx is None:
+            phase = self.phase.clone()
+        else:
+            phase = self.phase[env_idx].clone()
+            success = success[env_idx]
+            is_grasped = is_grasped[env_idx]
+            pre_inserted = pre_inserted[env_idx]
+
+        pick = phase == int(PegInsertionSideSkillPhase.PICK)
+        pre_insert = phase == int(PegInsertionSideSkillPhase.PRE_INSERT)
+        insert = phase == int(PegInsertionSideSkillPhase.INSERT)
+        active = pre_insert | insert
+        phase[pick & is_grasped] = int(PegInsertionSideSkillPhase.PRE_INSERT)
+        phase[pre_insert & is_grasped & pre_inserted] = int(
+            PegInsertionSideSkillPhase.INSERT
+        )
+        phase[insert & success] = int(PegInsertionSideSkillPhase.DONE)
+        phase[active & ~is_grasped & ~success] = int(
+            PegInsertionSideSkillPhase.PICK
+        )
+
+        if env_idx is None:
+            self.phase.copy_(phase)
+        else:
+            self.phase[env_idx] = phase
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        env_idx = self._normalize_env_idx(env_idx)
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        pick = phase == int(PegInsertionSideSkillPhase.PICK)
+        pre_insert = phase == int(PegInsertionSideSkillPhase.PRE_INSERT)
+        insert = phase == int(PegInsertionSideSkillPhase.INSERT)
+        done = phase == int(PegInsertionSideSkillPhase.DONE)
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[pick] = SKILL_IDS["pick"]
+        skill_id[pre_insert] = SKILL_IDS["insert"]
+        skill_id[insert] = SKILL_IDS["insert"]
+
+        peg_pose = Pose.create(self._select(env.peg.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        goal_pose = Pose.create(self._select(env.goal_pose.raw_pose, env_idx))
+
+        pick_offset_pos = torch.zeros_like(peg_pose.p)
+        pick_offset_pos[:, 0] = -0.06
+        pick_center = (peg_pose * Pose.create_from_pq(p=pick_offset_pos)).p
+        pick_target_pose = build_panda_topdown_grasp_pose(
+            center=pick_center,
+            tcp_pose=tcp_pose,
+            object_pose=peg_pose,
+        )
+
+        base_insert_target_pose = goal_pose * peg_pose.inv() * tcp_pose
+        peg_half_length = self._select(env.peg_half_sizes[:, 0], env_idx).reshape(-1)
+        pre_insert_offset_pos = torch.zeros_like(peg_pose.p)
+        pre_insert_offset_pos[:, 0] = -0.01 - peg_half_length
+        pre_insert_target_pose = base_insert_target_pose * Pose.create_from_pq(
+            p=pre_insert_offset_pos
+        )
+        insert_offset_pos = torch.zeros_like(peg_pose.p)
+        insert_offset_pos[:, 0] = 0.05
+        insert_target_pose = base_insert_target_pose * Pose.create_from_pq(
+            p=insert_offset_pos
+        )
+
+        target_pose_world = pick_target_pose.to_transformation_matrix()
+        target_pose_world = torch.where(
+            pre_insert[:, None, None],
+            pre_insert_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world = torch.where(
+            insert[:, None, None],
+            insert_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
+
+        target_gripper_width = torch.full(
+            phase.shape,
+            float("nan"),
+            dtype=torch.float32,
+            device=phase.device,
+        )
+        target_gripper_width[pick | pre_insert | insert] = 0.025
+
+        phase_names_by_id = {
+            int(PegInsertionSideSkillPhase.PICK): "pick",
+            int(PegInsertionSideSkillPhase.PRE_INSERT): "pre_insert",
+            int(PegInsertionSideSkillPhase.INSERT): "insert",
+            int(PegInsertionSideSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(PegInsertionSideSkillPhase.PICK): "pick",
+            int(PegInsertionSideSkillPhase.PRE_INSERT): "insert",
+            int(PegInsertionSideSkillPhase.INSERT): "insert",
+            int(PegInsertionSideSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(PegInsertionSideSkillPhase.PICK): "move_to_peg",
+            int(PegInsertionSideSkillPhase.PRE_INSERT): "align_peg_with_hole",
+            int(PegInsertionSideSkillPhase.INSERT): "insert_peg_into_hole",
+            int(PegInsertionSideSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+        target_objects = [
+            None if x == int(PegInsertionSideSkillPhase.DONE) else "tcp"
+            for x in phase_ids
+        ]
+
+        info = env.evaluate()
+        is_grasped = env.agent.is_grasping(env.peg, max_angle=20)
+        pre_inserted, _, _ = env.get_peg_pre_insertion_info()
+        task_meta = {
+            "task": "PegInsertionSide-v1",
+            "target_frame": "world",
+            "success": self._select(info["success"], env_idx),
+            "is_grasped": self._select(is_grasped, env_idx),
+            "pre_inserted": self._select(pre_inserted, env_idx),
+            "peg_head_pos_at_hole": self._select(
+                info["peg_head_pos_at_hole"], env_idx
+            ),
+        }
+
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=target_point_world,
+            target_pose_world=target_pose_world,
+            target_gripper_width=target_gripper_width,
+            active_object=["peg"] * len(phase_ids),
+            target_object=target_objects,
+            task_meta=task_meta,
+        )
 
 
 @register_env("PegInsertionSide-v1", max_episode_steps=100)
@@ -246,6 +436,19 @@ class PegInsertionSideEnv(BaseEnv):
             qpos[:, -2:] = 0.04
             self.agent.robot.set_qpos(qpos)
             self.agent.robot.set_pose(sapien.Pose([-0.615, 0, 0]))
+            self._get_or_create_skill_annotation_fsm().reset(env_idx)
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, PegInsertionSideSkillFSM):
+            fsm = PegInsertionSideSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     # save some commonly used attributes
     @property
@@ -265,6 +468,19 @@ class PegInsertionSideEnv(BaseEnv):
         # NOTE (stao): this is fixed after each _initialize_episode call. You can cache this value
         # and simply store it after _initialize_episode or set_state_dict calls.
         return self.box.pose * self.box_hole_offsets * self.peg_head_offsets.inv()
+
+    def get_peg_pre_insertion_info(self):
+        goal_pose_inv = self.goal_pose.inv()
+        peg_head_wrt_goal = goal_pose_inv * self.peg_head_pose
+        peg_head_wrt_goal_yz_dist = torch.linalg.norm(
+            peg_head_wrt_goal.p[:, 1:], axis=1
+        )
+        peg_wrt_goal = goal_pose_inv * self.peg.pose
+        peg_wrt_goal_yz_dist = torch.linalg.norm(peg_wrt_goal.p[:, 1:], axis=1)
+        pre_inserted = (peg_head_wrt_goal_yz_dist < 0.01) & (
+            peg_wrt_goal_yz_dist < 0.01
+        )
+        return pre_inserted, peg_head_wrt_goal_yz_dist, peg_wrt_goal_yz_dist
 
     def has_peg_inserted(self):
         # Only head position is used in fact
@@ -320,12 +536,11 @@ class PegInsertionSideEnv(BaseEnv):
         # Stage 3: Orient the grasped peg properly towards the hole
 
         # pre-insertion award, encouraging both the peg center and the peg head to match the yz coordinates of goal_pose
-        peg_head_wrt_goal = self.goal_pose.inv() * self.peg_head_pose
-        peg_head_wrt_goal_yz_dist = torch.linalg.norm(
-            peg_head_wrt_goal.p[:, 1:], axis=1
-        )
-        peg_wrt_goal = self.goal_pose.inv() * self.peg.pose
-        peg_wrt_goal_yz_dist = torch.linalg.norm(peg_wrt_goal.p[:, 1:], axis=1)
+        (
+            pre_inserted,
+            peg_head_wrt_goal_yz_dist,
+            peg_wrt_goal_yz_dist,
+        ) = self.get_peg_pre_insertion_info()
 
         pre_insertion_reward = 3 * (
             1
@@ -335,11 +550,6 @@ class PegInsertionSideEnv(BaseEnv):
             )
         )
         reward += pre_insertion_reward * is_grasped
-        # stage 3 passes if peg is correctly oriented in order to insert into hole easily
-        pre_inserted = (peg_head_wrt_goal_yz_dist < 0.01) & (
-            peg_wrt_goal_yz_dist < 0.01
-        )
-
         # Stage 4: Insert the peg into the hole once it is grasped and lined up
         peg_head_wrt_goal_inside_hole = self.box_hole_pose.inv() * self.peg_head_pose
         insertion_reward = 5 * (

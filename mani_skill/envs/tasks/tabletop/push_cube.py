@@ -15,6 +15,7 @@ in addition to initializing any task relevant data like a goal
 See comments for how to make your own environment and what each required function should do
 """
 
+from enum import IntEnum
 from typing import Any, Union
 
 import numpy as np
@@ -29,9 +30,187 @@ from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
+
+
+class PushCubeSkillPhase(IntEnum):
+    ALIGN = 0
+    PUSH = 1
+    DONE = 2
+
+
+class PushCubeSkillFSM:
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(PushCubeSkillPhase.ALIGN),
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _normalize_env_idx(self, env_idx=None):
+        if env_idx is None:
+            return None
+        if torch.is_tensor(env_idx):
+            return env_idx.to(device=self.phase.device, dtype=torch.long).flatten()
+        return torch.as_tensor(
+            env_idx, device=self.phase.device, dtype=torch.long
+        ).flatten()
+
+    def _select(self, tensor: torch.Tensor, env_idx=None) -> torch.Tensor:
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            return tensor
+        return tensor[env_idx]
+
+    def _compute_signals(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        info = env.evaluate()
+        obj_pos = env.obj.pose.p
+        goal_pos = env.goal_region.pose.p
+        tcp_push_pos = obj_pos + torch.tensor(
+            [-env.cube_half_size - 0.005, 0, 0], device=env.device
+        )
+        tcp_to_push_dist = torch.linalg.norm(
+            env.agent.tcp.pose.p - tcp_push_pos, dim=1
+        )
+        object_goal_point_world = goal_pos.clone()
+        object_goal_point_world[:, 2] = obj_pos[:, 2]
+        push_direction_world = torch.zeros_like(obj_pos)
+        push_direction_world[:, 0] = 1
+        signals = {
+            "success": info["success"],
+            "reached_push_pose": tcp_to_push_dist < 0.01,
+            "tcp_to_push_dist": tcp_to_push_dist,
+            "obj_to_goal_dist": torch.linalg.norm(
+                obj_pos[:, :2] - goal_pos[:, :2], dim=1
+            ),
+            "is_obj_on_table": obj_pos[:, 2] < env.cube_half_size + 0.005,
+            "push_direction_world": push_direction_world,
+            "object_goal_point_world": object_goal_point_world,
+        }
+        if env_idx is None:
+            return signals
+        return {
+            key: value[env_idx] if torch.is_tensor(value) else value
+            for key, value in signals.items()
+        }
+
+    def reset(self, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            self.phase.fill_(int(PushCubeSkillPhase.ALIGN))
+        else:
+            self.phase[env_idx] = int(PushCubeSkillPhase.ALIGN)
+
+    def update(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        signals = self._compute_signals(env, env_idx)
+        reached_push_pose = signals["reached_push_pose"]
+        success = signals["success"]
+
+        if env_idx is None:
+            phase = self.phase.clone()
+        else:
+            phase = self.phase[env_idx].clone()
+
+        align = phase == int(PushCubeSkillPhase.ALIGN)
+        push = phase == int(PushCubeSkillPhase.PUSH)
+        phase[align & reached_push_pose] = int(PushCubeSkillPhase.PUSH)
+        phase[push & success] = int(PushCubeSkillPhase.DONE)
+
+        if env_idx is None:
+            self.phase.copy_(phase)
+        else:
+            self.phase[env_idx] = phase
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        env_idx = self._normalize_env_idx(env_idx)
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        align = phase == int(PushCubeSkillPhase.ALIGN)
+        push = phase == int(PushCubeSkillPhase.PUSH)
+        done = phase == int(PushCubeSkillPhase.DONE)
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[align] = SKILL_IDS["push"]
+        skill_id[push] = SKILL_IDS["push"]
+
+        obj_pos = self._select(env.obj.pose.p, env_idx).reshape(-1, 3)
+        goal_pos = self._select(env.goal_region.pose.p, env_idx).reshape(-1, 3)
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+
+        align_target_pos = obj_pos + torch.tensor([-0.025, 0, 0], device=env.device)
+        push_target_pos = obj_pos.clone()
+        push_target_pos[:, 0] = goal_pos[:, 0] - 0.12
+        push_target_pos[:, 1] = goal_pos[:, 1]
+        align_target_pose = Pose.create_from_pq(p=align_target_pos, q=tcp_pose.q)
+        push_target_pose = Pose.create_from_pq(p=push_target_pos, q=tcp_pose.q)
+
+        target_pose_world = torch.where(
+            push[:, None, None],
+            push_target_pose.to_transformation_matrix(),
+            align_target_pose.to_transformation_matrix(),
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
+
+        target_gripper_width = torch.zeros(
+            phase.shape, dtype=torch.float32, device=phase.device
+        )
+
+        phase_names_by_id = {
+            int(PushCubeSkillPhase.ALIGN): "align",
+            int(PushCubeSkillPhase.PUSH): "push",
+            int(PushCubeSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(PushCubeSkillPhase.ALIGN): "push",
+            int(PushCubeSkillPhase.PUSH): "push",
+            int(PushCubeSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(PushCubeSkillPhase.ALIGN): "move_tcp_behind_cube",
+            int(PushCubeSkillPhase.PUSH): "push_cube_to_goal",
+            int(PushCubeSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+        target_objects = [
+            None if x == int(PushCubeSkillPhase.DONE) else "tcp"
+            for x in phase_ids
+        ]
+
+        signals = self._compute_signals(env, env_idx)
+        task_meta = {
+            "task": "PushCube-v1",
+            "target_frame": "world",
+            "target_entity": "tcp",
+            "success": signals["success"],
+            "reached_push_pose": signals["reached_push_pose"],
+            "tcp_to_push_dist": signals["tcp_to_push_dist"],
+            "obj_to_goal_dist": signals["obj_to_goal_dist"],
+            "is_obj_on_table": signals["is_obj_on_table"],
+            "push_direction_world": signals["push_direction_world"],
+            "object_goal_point_world": signals["object_goal_point_world"],
+        }
+
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=target_point_world,
+            target_pose_world=target_pose_world,
+            target_gripper_width=target_gripper_width,
+            active_object=["cube"] * len(phase_ids),
+            target_object=target_objects,
+            task_meta=task_meta,
+        )
 
 
 @register_env("PushCube-v1", max_episode_steps=50)
@@ -175,6 +354,19 @@ class PushCubeEnv(BaseEnv):
                     q=euler2quat(0, np.pi / 2, 0),
                 )
             )
+            self._get_or_create_skill_annotation_fsm().reset(env_idx)
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, PushCubeSkillFSM):
+            fsm = PushCubeSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     def evaluate(self):
         # success is achieved when the cube's xy position on the table is within the

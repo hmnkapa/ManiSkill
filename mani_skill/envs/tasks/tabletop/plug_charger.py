@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Union
 
 import numpy as np
@@ -13,8 +14,246 @@ from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.geometry import rotation_conversions
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
+from mani_skill.utils.skill_annotation.targets import (
+    build_panda_topdown_grasp_pose,
+    target_tcp_pose_from_object_goal,
+)
 from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.structs.types import SimConfig
+
+
+class PlugChargerSkillPhase(IntEnum):
+    PICK = 0
+    PRE_INSERT = 1
+    INSERT = 2
+    DONE = 3
+
+
+class PlugChargerSkillFSM:
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(PlugChargerSkillPhase.PICK),
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _normalize_env_idx(self, env_idx=None):
+        if env_idx is None:
+            return None
+        if torch.is_tensor(env_idx):
+            return env_idx.to(device=self.phase.device, dtype=torch.long).flatten()
+        return torch.as_tensor(
+            env_idx, device=self.phase.device, dtype=torch.long
+        ).flatten()
+
+    def _select(self, tensor: torch.Tensor, env_idx=None) -> torch.Tensor:
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            return tensor
+        return tensor[env_idx]
+
+    def _pre_insert_object_pose(self, goal_pose: Pose) -> Pose:
+        return goal_pose * Pose.create_from_pq(
+            p=torch.tensor([-0.05, 0.0, 0.0], device=goal_pose.device)
+        )
+
+    def _quaternion_angle(self, quaternion: torch.Tensor) -> torch.Tensor:
+        quaternion = quaternion / torch.linalg.norm(
+            quaternion, dim=1, keepdim=True
+        ).clamp_min(1e-6)
+        return 2 * torch.acos(quaternion[:, 0].abs().clamp(max=1.0))
+
+    def _compute_signals(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        info = env.evaluate()
+        charger_pose = Pose.create(env.charger.pose.raw_pose)
+        goal_pose = Pose.create(env.goal_pose.raw_pose)
+        pre_insert_object_pose = self._pre_insert_object_pose(goal_pose)
+        pre_rel = pre_insert_object_pose.inv() * charger_pose
+        pre_x_error = torch.abs(pre_rel.p[:, 0])
+        pre_yz_error = torch.linalg.norm(pre_rel.p[:, 1:], dim=1)
+        pre_angle_error = self._quaternion_angle(pre_rel.q)
+        pre_inserted = (
+            (pre_x_error < 0.01)
+            & (pre_yz_error < 0.005)
+            & (pre_angle_error < 0.10)
+        )
+        signals = {
+            "success": info["success"],
+            "is_grasped": env.agent.is_grasping(env.charger, max_angle=20),
+            "obj_to_goal_dist": info["obj_to_goal_dist"],
+            "obj_to_goal_angle": info["obj_to_goal_angle"],
+            "pre_inserted": pre_inserted,
+            "pre_x_error": pre_x_error,
+            "pre_yz_error": pre_yz_error,
+            "pre_angle_error": pre_angle_error,
+            "charger_base_pose_world": env.charger_base_pose.to_transformation_matrix(),
+            "object_goal_pose_world": goal_pose.to_transformation_matrix(),
+        }
+        if env_idx is None:
+            return signals
+        return {
+            key: value[env_idx] if torch.is_tensor(value) else value
+            for key, value in signals.items()
+        }
+
+    def reset(self, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            self.phase.fill_(int(PlugChargerSkillPhase.PICK))
+        else:
+            self.phase[env_idx] = int(PlugChargerSkillPhase.PICK)
+
+    def update(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        signals = self._compute_signals(env, env_idx)
+        is_grasped = signals["is_grasped"]
+        pre_inserted = signals["pre_inserted"]
+        success = signals["success"]
+
+        if env_idx is None:
+            phase = self.phase.clone()
+        else:
+            phase = self.phase[env_idx].clone()
+
+        pick = phase == int(PlugChargerSkillPhase.PICK)
+        pre_insert = phase == int(PlugChargerSkillPhase.PRE_INSERT)
+        insert = phase == int(PlugChargerSkillPhase.INSERT)
+        phase[pick & is_grasped] = int(PlugChargerSkillPhase.PRE_INSERT)
+        phase[pre_insert & is_grasped & pre_inserted] = int(
+            PlugChargerSkillPhase.INSERT
+        )
+        phase[insert & success] = int(PlugChargerSkillPhase.DONE)
+
+        if env_idx is None:
+            self.phase.copy_(phase)
+        else:
+            self.phase[env_idx] = phase
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        env_idx = self._normalize_env_idx(env_idx)
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        pick = phase == int(PlugChargerSkillPhase.PICK)
+        pre_insert = phase == int(PlugChargerSkillPhase.PRE_INSERT)
+        insert = phase == int(PlugChargerSkillPhase.INSERT)
+        done = phase == int(PlugChargerSkillPhase.DONE)
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[pick] = SKILL_IDS["pick"]
+        skill_id[pre_insert] = SKILL_IDS["insert"]
+        skill_id[insert] = SKILL_IDS["insert"]
+
+        charger_pose = Pose.create(self._select(env.charger.pose.raw_pose, env_idx))
+        charger_base_pose = Pose.create(
+            self._select(env.charger_base_pose.raw_pose, env_idx)
+        )
+        goal_pose = Pose.create(self._select(env.goal_pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+
+        pick_target_pose = build_panda_topdown_grasp_pose(
+            center=charger_base_pose.p,
+            tcp_pose=tcp_pose,
+            object_pose=charger_base_pose,
+        )
+        grasp_angle = torch.zeros((len(phase), 3), device=phase.device)
+        grasp_angle[:, 1] = np.deg2rad(15)
+        grasp_q = rotation_conversions.matrix_to_quaternion(
+            rotation_conversions.euler_angles_to_matrix(grasp_angle, "XYZ")
+        )
+        pick_target_pose = pick_target_pose * Pose.create_from_pq(q=grasp_q)
+
+        pre_insert_object_pose = self._pre_insert_object_pose(goal_pose)
+        pre_insert_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=charger_pose,
+            desired_object_pose=pre_insert_object_pose,
+        )
+        insert_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=charger_pose,
+            desired_object_pose=goal_pose,
+        )
+
+        target_pose_world = pick_target_pose.to_transformation_matrix()
+        target_pose_world = torch.where(
+            pre_insert[:, None, None],
+            pre_insert_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world = torch.where(
+            insert[:, None, None],
+            insert_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
+
+        target_gripper_width = torch.full(
+            phase.shape,
+            0.025,
+            dtype=torch.float32,
+            device=phase.device,
+        )
+        target_gripper_width[done] = float("nan")
+
+        phase_names_by_id = {
+            int(PlugChargerSkillPhase.PICK): "pick",
+            int(PlugChargerSkillPhase.PRE_INSERT): "pre_insert",
+            int(PlugChargerSkillPhase.INSERT): "insert",
+            int(PlugChargerSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(PlugChargerSkillPhase.PICK): "pick",
+            int(PlugChargerSkillPhase.PRE_INSERT): "insert",
+            int(PlugChargerSkillPhase.INSERT): "insert",
+            int(PlugChargerSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(PlugChargerSkillPhase.PICK): "grasp_charger_base",
+            int(PlugChargerSkillPhase.PRE_INSERT): "align_charger_with_receptacle",
+            int(PlugChargerSkillPhase.INSERT): "insert_charger",
+            int(PlugChargerSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+        target_objects = [
+            None if x == int(PlugChargerSkillPhase.DONE) else "tcp"
+            for x in phase_ids
+        ]
+
+        signals = self._compute_signals(env, env_idx)
+        task_meta = {
+            "task": "PlugCharger-v1",
+            "target_frame": "world",
+            "target_entity": "tcp",
+            "success": signals["success"],
+            "is_grasped": signals["is_grasped"],
+            "obj_to_goal_dist": signals["obj_to_goal_dist"],
+            "obj_to_goal_angle": signals["obj_to_goal_angle"],
+            "pre_inserted": signals["pre_inserted"],
+            "pre_x_error": signals["pre_x_error"],
+            "pre_yz_error": signals["pre_yz_error"],
+            "pre_angle_error": signals["pre_angle_error"],
+            "charger_base_pose_world": signals["charger_base_pose_world"],
+            "object_goal_pose_world": signals["object_goal_pose_world"],
+        }
+
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=target_point_world,
+            target_pose_world=target_pose_world,
+            target_gripper_width=target_gripper_width,
+            active_object=["charger"] * len(phase_ids),
+            target_object=target_objects,
+            task_meta=task_meta,
+        )
 
 
 @register_env("PlugCharger-v1", max_episode_steps=200)
@@ -239,10 +478,23 @@ class PlugChargerEnv(BaseEnv):
             self.goal_pose = self.receptacle.pose * (
                 sapien.Pose(q=euler2quat(0, 0, np.pi))
             )
+            self._get_or_create_skill_annotation_fsm().reset(env_idx)
 
     @property
     def charger_base_pose(self):
         return self.charger.pose * (sapien.Pose([-self._base_size[0], 0, 0]))
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, PlugChargerSkillFSM):
+            fsm = PlugChargerSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     def _compute_distance(self):
         obj_pose = self.charger.pose

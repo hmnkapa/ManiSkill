@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Any, Union
 
 import numpy as np
@@ -14,8 +15,356 @@ from mani_skill.utils.geometry import rotation_conversions
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.sapien_utils import look_at
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
+from mani_skill.utils.skill_annotation.schema import SkillAnnotationContext, SKILL_IDS
+from mani_skill.utils.skill_annotation.targets import (
+    build_panda_topdown_grasp_pose,
+    target_tcp_pose_from_object_goal,
+)
 from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.structs.types import Array
+
+
+class LiftPegUprightSkillPhase(IntEnum):
+    PICK = 0
+    LIFT = 1
+    ROTATE = 2
+    LOWER = 3
+    DONE = 4
+
+
+class LiftPegUprightSkillFSM:
+    _SAFE_HEIGHT_CLEARANCE = 0.10
+    _LIFT_HEIGHT_TOLERANCE = 0.02
+    _UPRIGHT_AXIS_TOLERANCE = 0.08
+
+    def __init__(self, num_envs: int, device):
+        self.phase = torch.full(
+            (num_envs,),
+            int(LiftPegUprightSkillPhase.PICK),
+            dtype=torch.long,
+            device=device,
+        )
+        self._rotate_target_pose_world = torch.full(
+            (num_envs, 4, 4),
+            float("nan"),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._rotate_target_valid = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
+        )
+
+    def _normalize_env_idx(self, env_idx=None):
+        if env_idx is None:
+            return None
+        if torch.is_tensor(env_idx):
+            return env_idx.to(device=self.phase.device, dtype=torch.long).flatten()
+        return torch.as_tensor(
+            env_idx, device=self.phase.device, dtype=torch.long
+        ).flatten()
+
+    def _select(self, tensor: torch.Tensor, env_idx=None) -> torch.Tensor:
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            return tensor
+        return tensor[env_idx]
+
+    def _safe_peg_height(self, env, peg_pose: Pose) -> torch.Tensor:
+        return torch.full_like(
+            peg_pose.p[:, 2],
+            env.peg_half_length + self._SAFE_HEIGHT_CLEARANCE,
+        )
+
+    def _nearest_upright_quaternion(self, quaternion: torch.Tensor) -> torch.Tensor:
+        candidates = torch.as_tensor(
+            [
+                [0.5, 0.5, -0.5, 0.5],
+                [0.5, 0.5, 0.5, -0.5],
+                [0.5, -0.5, -0.5, -0.5],
+                [0.5, -0.5, 0.5, 0.5],
+            ],
+            dtype=quaternion.dtype,
+            device=quaternion.device,
+        )
+        scores = torch.abs(quaternion @ candidates.T)
+        return candidates[torch.argmax(scores, dim=1)]
+
+    def _peg_pose_at_height(
+        self,
+        peg_pose: Pose,
+        height,
+        upright: bool,
+    ) -> Pose:
+        desired_pos = peg_pose.p.clone()
+        desired_pos[:, 2] = height
+        desired_q = (
+            self._nearest_upright_quaternion(peg_pose.q)
+            if upright
+            else peg_pose.q
+        )
+        return Pose.create_from_pq(p=desired_pos, q=desired_q)
+
+    def _lifted_peg_pose(self, env, peg_pose: Pose, upright: bool) -> Pose:
+        return self._peg_pose_at_height(
+            peg_pose=peg_pose,
+            height=self._safe_peg_height(env, peg_pose),
+            upright=upright,
+        )
+
+    def _desired_peg_pose(self, env, peg_pose: Pose) -> Pose:
+        return self._peg_pose_at_height(
+            peg_pose=peg_pose,
+            height=env.peg_half_length,
+            upright=True,
+        )
+
+    def _rotation_target_pose(self, peg_pose: Pose, tcp_pose: Pose) -> Pose:
+        desired_peg_pose = Pose.create_from_pq(
+            p=peg_pose.p,
+            q=self._nearest_upright_quaternion(peg_pose.q),
+        )
+        target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=peg_pose,
+            desired_object_pose=desired_peg_pose,
+        )
+        return Pose.create_from_pq(p=tcp_pose.p, q=target_pose.q)
+
+    def _cache_rotation_target(self, env, mask: torch.Tensor, env_idx=None):
+        peg_pose = Pose.create(self._select(env.peg.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        target_pose_world = self._rotation_target_pose(
+            peg_pose, tcp_pose
+        ).to_transformation_matrix()
+        if env_idx is None:
+            self._rotate_target_pose_world[mask] = target_pose_world[mask]
+            self._rotate_target_valid[mask] = True
+        else:
+            target_env_idx = env_idx[mask]
+            self._rotate_target_pose_world[target_env_idx] = target_pose_world[mask]
+            self._rotate_target_valid[target_env_idx] = True
+
+    def _invalidate_rotation_target(self, mask: torch.Tensor, env_idx=None):
+        target_env_idx = mask if env_idx is None else env_idx[mask]
+        self._rotate_target_pose_world[target_env_idx] = float("nan")
+        self._rotate_target_valid[target_env_idx] = False
+
+    def _compute_signals(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        info = env.evaluate()
+        peg_pose = env.peg.pose
+        peg_rotation = rotation_conversions.quaternion_to_matrix(peg_pose.q)
+        peg_euler_xyz = rotation_conversions.matrix_to_euler_angles(
+            peg_rotation, "XYZ"
+        )
+        peg_axis_world = peg_rotation[:, :, 0]
+        upright_axis_error = torch.acos(peg_axis_world[:, 2].abs().clamp(-1.0, 1.0))
+        orientation_aligned = upright_axis_error < self._UPRIGHT_AXIS_TOLERANCE
+        safe_peg_height = self._safe_peg_height(env, peg_pose)
+        lift_height_error = (safe_peg_height - peg_pose.p[:, 2]).clamp_min(0.0)
+        is_lifted = lift_height_error < self._LIFT_HEIGHT_TOLERANCE
+        z_error = torch.abs(peg_pose.p[:, 2] - env.peg_half_length)
+        is_peg_upright = torch.abs(torch.abs(peg_euler_xyz[:, 2]) - np.pi / 2) < 0.08
+        close_to_table = z_error < 0.005
+        desired_peg_pose = self._desired_peg_pose(env, peg_pose)
+        signals = {
+            "success": info["success"],
+            "is_grasped": env.agent.is_grasping(env.peg),
+            "is_peg_upright": is_peg_upright,
+            "close_to_table": close_to_table,
+            "safe_peg_height": safe_peg_height,
+            "lift_height_error": lift_height_error,
+            "is_lifted": is_lifted,
+            "upright_axis_error": upright_axis_error,
+            "orientation_aligned": orientation_aligned,
+            "z_error": z_error,
+            "desired_peg_pose_world": desired_peg_pose.to_transformation_matrix(),
+        }
+        if env_idx is None:
+            return signals
+        return {
+            key: value[env_idx] if torch.is_tensor(value) else value
+            for key, value in signals.items()
+        }
+
+    def reset(self, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        if env_idx is None:
+            self.phase.fill_(int(LiftPegUprightSkillPhase.PICK))
+            self._rotate_target_pose_world.fill_(float("nan"))
+            self._rotate_target_valid.fill_(False)
+        else:
+            self.phase[env_idx] = int(LiftPegUprightSkillPhase.PICK)
+            self._rotate_target_pose_world[env_idx] = float("nan")
+            self._rotate_target_valid[env_idx] = False
+
+    def update(self, env, env_idx=None):
+        env_idx = self._normalize_env_idx(env_idx)
+        signals = self._compute_signals(env, env_idx)
+        is_grasped = signals["is_grasped"]
+        is_lifted = signals["is_lifted"]
+        orientation_aligned = signals["orientation_aligned"]
+        success = signals["success"]
+
+        if env_idx is None:
+            phase = self.phase.clone()
+        else:
+            phase = self.phase[env_idx].clone()
+
+        pick = phase == int(LiftPegUprightSkillPhase.PICK)
+        lift = phase == int(LiftPegUprightSkillPhase.LIFT)
+        rotate = phase == int(LiftPegUprightSkillPhase.ROTATE)
+        lower = phase == int(LiftPegUprightSkillPhase.LOWER)
+        active = lift | rotate | lower
+        enter_lift = pick & is_grasped
+        enter_rotate = lift & is_grasped & is_lifted
+        grasp_lost = active & ~is_grasped & ~success
+        self._invalidate_rotation_target(enter_lift | grasp_lost, env_idx)
+        self._cache_rotation_target(env, enter_rotate, env_idx)
+        phase[enter_lift] = int(LiftPegUprightSkillPhase.LIFT)
+        phase[enter_rotate] = int(LiftPegUprightSkillPhase.ROTATE)
+        phase[rotate & is_grasped & orientation_aligned] = int(
+            LiftPegUprightSkillPhase.LOWER
+        )
+        phase[lower & success] = int(LiftPegUprightSkillPhase.DONE)
+        phase[grasp_lost] = int(LiftPegUprightSkillPhase.PICK)
+
+        if env_idx is None:
+            self.phase.copy_(phase)
+        else:
+            self.phase[env_idx] = phase
+
+    def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
+        env_idx = self._normalize_env_idx(env_idx)
+        phase = self.phase if env_idx is None else self.phase[env_idx]
+        phase = phase.reshape(-1)
+
+        pick = phase == int(LiftPegUprightSkillPhase.PICK)
+        lift = phase == int(LiftPegUprightSkillPhase.LIFT)
+        rotate = phase == int(LiftPegUprightSkillPhase.ROTATE)
+        lower = phase == int(LiftPegUprightSkillPhase.LOWER)
+        done = phase == int(LiftPegUprightSkillPhase.DONE)
+        active = lift | rotate | lower
+
+        skill_id = torch.full_like(phase, SKILL_IDS["none"])
+        skill_id[pick] = SKILL_IDS["pick"]
+        skill_id[active] = SKILL_IDS["place"]
+
+        peg_pose = Pose.create(self._select(env.peg.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        pick_target_pose = build_panda_topdown_grasp_pose(
+            center=peg_pose.p,
+            tcp_pose=tcp_pose,
+            object_pose=peg_pose,
+        )
+        pick_target_pose = pick_target_pose * Pose.create_from_pq(
+            p=torch.tensor([0.10, 0.0, 0.0], device=env.device)
+        )
+
+        lifted_peg_pose = self._lifted_peg_pose(env, peg_pose, upright=False)
+        lift_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=peg_pose,
+            desired_object_pose=lifted_peg_pose,
+        )
+        rotate_target_valid = self._select(self._rotate_target_valid, env_idx)
+        self._cache_rotation_target(env, rotate & ~rotate_target_valid, env_idx)
+        rotate_target_pose_world = self._select(
+            self._rotate_target_pose_world, env_idx
+        )
+        desired_peg_pose = self._desired_peg_pose(env, peg_pose)
+        lower_target_pose = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=peg_pose,
+            desired_object_pose=desired_peg_pose,
+        )
+
+        target_pose_world = pick_target_pose.to_transformation_matrix()
+        target_pose_world = torch.where(
+            lift[:, None, None],
+            lift_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world = torch.where(
+            rotate[:, None, None],
+            rotate_target_pose_world,
+            target_pose_world,
+        )
+        target_pose_world = torch.where(
+            lower[:, None, None],
+            lower_target_pose.to_transformation_matrix(),
+            target_pose_world,
+        )
+        target_pose_world[done] = float("nan")
+        target_point_world = target_pose_world[:, :3, 3].clone()
+
+        target_gripper_width = torch.full(
+            phase.shape,
+            float("nan"),
+            dtype=torch.float32,
+            device=phase.device,
+        )
+        target_gripper_width[pick | lift | rotate] = 0.045
+        target_gripper_width[lower] = 0.08
+
+        phase_names_by_id = {
+            int(LiftPegUprightSkillPhase.PICK): "pick",
+            int(LiftPegUprightSkillPhase.LIFT): "lift",
+            int(LiftPegUprightSkillPhase.ROTATE): "rotate",
+            int(LiftPegUprightSkillPhase.LOWER): "lower",
+            int(LiftPegUprightSkillPhase.DONE): "done",
+        }
+        skill_names_by_phase_id = {
+            int(LiftPegUprightSkillPhase.PICK): "pick",
+            int(LiftPegUprightSkillPhase.LIFT): "place",
+            int(LiftPegUprightSkillPhase.ROTATE): "place",
+            int(LiftPegUprightSkillPhase.LOWER): "place",
+            int(LiftPegUprightSkillPhase.DONE): "none",
+        }
+        skill_states_by_phase_id = {
+            int(LiftPegUprightSkillPhase.PICK): "grasp_peg_near_end",
+            int(LiftPegUprightSkillPhase.LIFT): "lift_peg_to_safe_height",
+            int(LiftPegUprightSkillPhase.ROTATE): "rotate_peg_upright",
+            int(LiftPegUprightSkillPhase.LOWER): "lower_peg_to_table",
+            int(LiftPegUprightSkillPhase.DONE): "task_done",
+        }
+        phase_ids = [int(x) for x in phase.detach().cpu().tolist()]
+        target_objects = [
+            None if x == int(LiftPegUprightSkillPhase.DONE) else "tcp"
+            for x in phase_ids
+        ]
+
+        signals = self._compute_signals(env, env_idx)
+        task_meta = {
+            "task": "LiftPegUpright-v1",
+            "target_frame": "world",
+            "target_entity": "tcp",
+            "success": signals["success"],
+            "is_grasped": signals["is_grasped"],
+            "is_peg_upright": signals["is_peg_upright"],
+            "close_to_table": signals["close_to_table"],
+            "safe_peg_height": signals["safe_peg_height"],
+            "lift_height_error": signals["lift_height_error"],
+            "is_lifted": signals["is_lifted"],
+            "upright_axis_error": signals["upright_axis_error"],
+            "orientation_aligned": signals["orientation_aligned"],
+            "z_error": signals["z_error"],
+            "desired_peg_pose_world": signals["desired_peg_pose_world"],
+        }
+
+        return SkillAnnotationContext(
+            skill_id=skill_id,
+            skill=[skill_names_by_phase_id[x] for x in phase_ids],
+            phase_id=phase,
+            phase=[phase_names_by_id[x] for x in phase_ids],
+            skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
+            target_point_world=target_point_world,
+            target_pose_world=target_pose_world,
+            target_gripper_width=target_gripper_width,
+            active_object=["peg"] * len(phase_ids),
+            target_object=target_objects,
+            task_meta=task_meta,
+        )
 
 
 @register_env("LiftPegUpright-v1", max_episode_steps=50)
@@ -85,6 +434,19 @@ class LiftPegUprightEnv(BaseEnv):
 
             obj_pose = Pose.create_from_pq(p=xyz, q=q)
             self.peg.set_pose(obj_pose)
+            self._get_or_create_skill_annotation_fsm().reset(env_idx)
+
+    def _get_or_create_skill_annotation_fsm(self):
+        fsm = getattr(self, "_skill_annotation_fsm", None)
+        if not isinstance(fsm, LiftPegUprightSkillFSM):
+            fsm = LiftPegUprightSkillFSM(num_envs=self.num_envs, device=self.device)
+            self._skill_annotation_fsm = fsm
+        return fsm
+
+    def get_skill_annotation_context(self, env_idx=None):
+        fsm = self._get_or_create_skill_annotation_fsm()
+        fsm.update(self, env_idx)
+        return fsm.build_context(self, env_idx)
 
     def evaluate(self):
         q = self.peg.pose.q

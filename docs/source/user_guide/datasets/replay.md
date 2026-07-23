@@ -19,6 +19,36 @@ python -m mani_skill.trajectory.replay_trajectory -h
 The script requires `trajectory.h5` and `trajectory.json` to be both under the same directory.
 :::
 
+## Rendering Skill-Annotated Trajectories
+
+Trajectories recorded with `RecordEpisode(record_skill_annotations=True)` can be
+rendered with their skill label, target point, grasp target, and phase ID overlaid
+on the video:
+
+```bash
+python -m mani_skill.trajectory.render_annotated_trajectory \
+  --traj-path path/to/trajectory.h5 \
+  --episode-id 0 \
+  --output-path path/to/annotated.mp4
+```
+
+Omit `--episode-id` and use `--output-dir` to render every annotated episode as a
+separate video. Use `--camera-name` to select a human render camera or RGB sensor:
+
+```bash
+python -m mani_skill.trajectory.render_annotated_trajectory \
+  --traj-path path/to/trajectory.h5 \
+  --output-dir path/to/annotated_videos \
+  --camera-name render_camera
+```
+
+By default, the tool uses annotations stored under each trajectory's
+`skill_annotations` group. For older trajectory files without that group, it
+falls back to the environment's runtime skill annotator when one is available.
+Use `--annotation-source stored` or `--annotation-source runtime` to require one
+source explicitly. Recorded environment states are applied automatically when
+available; pass `--replay-mode actions` to use action replay alone.
+
 By default raw demonstration files contain all the necessary information (e.g. initial states, actions, seeds) to reproduce a trajectory. Observations are not included since they can lead to large file sizes without postprocessing. In addition, actions in these files do not cover all control modes. Therefore, you need to convert the raw files into your desired observation and control modes. We provide a utility script that works as follows:
 
 ```bash
