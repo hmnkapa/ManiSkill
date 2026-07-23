@@ -162,7 +162,6 @@ class PushCubeSkillFSM:
         target_gripper_width = torch.zeros(
             phase.shape, dtype=torch.float32, device=phase.device
         )
-        target_gripper_width[done] = float("nan")
 
         phase_names_by_id = {
             int(PushCubeSkillPhase.ALIGN): "align",

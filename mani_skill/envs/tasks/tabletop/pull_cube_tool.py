@@ -220,8 +220,8 @@ class PullCubeToolSkillFSM:
         target_pose_world[done] = float("nan")
         target_point_world = target_pose_world[:, :3, 3].clone()
 
-        target_gripper_width = torch.zeros(
-            phase.shape, dtype=torch.float32, device=phase.device
+        target_gripper_width = torch.full(
+            phase.shape, 0.045, dtype=torch.float32, device=phase.device
         )
         target_gripper_width[done] = float("nan")
 

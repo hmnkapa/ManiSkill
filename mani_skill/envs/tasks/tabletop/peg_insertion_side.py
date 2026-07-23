@@ -176,6 +176,14 @@ class PegInsertionSideSkillFSM:
         target_pose_world[done] = float("nan")
         target_point_world = target_pose_world[:, :3, 3].clone()
 
+        target_gripper_width = torch.full(
+            phase.shape,
+            float("nan"),
+            dtype=torch.float32,
+            device=phase.device,
+        )
+        target_gripper_width[pick | pre_insert | insert] = 0.025
+
         phase_names_by_id = {
             int(PegInsertionSideSkillPhase.PICK): "pick",
             int(PegInsertionSideSkillPhase.PRE_INSERT): "pre_insert",
@@ -222,7 +230,7 @@ class PegInsertionSideSkillFSM:
             skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
             target_point_world=target_point_world,
             target_pose_world=target_pose_world,
-            target_gripper_width=None,
+            target_gripper_width=target_gripper_width,
             active_object=["peg"] * len(phase_ids),
             target_object=target_objects,
             task_meta=task_meta,

@@ -183,6 +183,15 @@ class PlaceSphereSkillFSM:
         target_pose_world[done] = float("nan")
         target_point_world = target_pose_world[:, :3, 3].clone()
 
+        target_gripper_width = torch.full(
+            phase.shape,
+            float("nan"),
+            dtype=torch.float32,
+            device=phase.device,
+        )
+        target_gripper_width[pick | place] = 0.035
+        target_gripper_width[release] = 0.08
+
         phase_names_by_id = {
             int(PlaceSphereSkillPhase.PICK): "pick",
             int(PlaceSphereSkillPhase.PLACE): "place",
@@ -225,7 +234,7 @@ class PlaceSphereSkillFSM:
             skill_state=[skill_states_by_phase_id[x] for x in phase_ids],
             target_point_world=target_point_world,
             target_pose_world=target_pose_world,
-            target_gripper_width=None,
+            target_gripper_width=target_gripper_width,
             active_object=["sphere"] * len(phase_ids),
             target_object=target_objects,
             task_meta=task_meta,

@@ -434,7 +434,8 @@ def test_place_sphere_release_context_and_partial_update():
     ]
     assert normalized.target_pose_valid.tolist() == [True, True]
     assert normalized.target_point_valid.tolist() == [True, True]
-    assert context.target_gripper_width is None
+    assert context.target_gripper_width.tolist() == pytest.approx([0.035, 0.08])
+    assert normalized.target_gripper_width_valid.tolist() == [True, True]
     assert context.active_object == ["sphere", "sphere"]
     assert normalized.target_object == ["tcp", "tcp"]
     assert torch.allclose(
@@ -1566,13 +1567,21 @@ def test_tabletop_skill_fsm_done_has_no_tcp_target():
         assert torch.isnan(context.target_pose_world).all()
         assert torch.isnan(context.target_point_world).all()
         if context.target_gripper_width is not None:
-            assert torch.isnan(context.target_gripper_width).all()
+            if fsm_cls is PushCubeSkillFSM:
+                assert context.target_gripper_width.tolist() == [0.0, 0.0]
+            else:
+                assert torch.isnan(context.target_gripper_width).all()
         assert context.target_object == [None, None]
 
         normalized = normalize_skill_context(context, num_envs=2, device="cpu")
         assert normalized.target_pose_valid.tolist() == [False, False]
         assert normalized.target_point_valid.tolist() == [False, False]
-        assert normalized.target_gripper_width_valid.tolist() == [False, False]
+        expected_width_valid = (
+            [True, True] if fsm_cls is PushCubeSkillFSM else [False, False]
+        )
+        assert (
+            normalized.target_gripper_width_valid.tolist() == expected_width_valid
+        )
 
 
 def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
@@ -1585,6 +1594,7 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
                 PullCubeToolSkillPhase.ALIGN,
                 PullCubeToolSkillPhase.PULL,
             ],
+            0.045,
             "PullCubeTool-v1",
             {
                 "success",
@@ -1599,6 +1609,7 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
             PushCubeSkillFSM,
             _PushCubeFSMEnv(num_envs=2),
             [PushCubeSkillPhase.ALIGN, PushCubeSkillPhase.PUSH],
+            0.0,
             "PushCube-v1",
             {
                 "success",
@@ -1614,6 +1625,7 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
             PullCubeSkillFSM,
             _PullCubeFSMEnv(num_envs=2),
             [PullCubeSkillPhase.ALIGN, PullCubeSkillPhase.PULL],
+            0.0,
             "PullCube-v1",
             {
                 "success",
@@ -1628,6 +1640,7 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
             RollBallSkillFSM,
             _RollBallFSMEnv(num_envs=2),
             [RollBallSkillPhase.ALIGN, RollBallSkillPhase.HIT],
+            0.0,
             "RollBall-v1",
             {
                 "success",
@@ -1642,7 +1655,7 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
         ),
     ]
 
-    for fsm_cls, env, phases, task_name, meta_keys in cases:
+    for fsm_cls, env, phases, expected_width, task_name, meta_keys in cases:
         fsm = fsm_cls(num_envs=len(phases), device="cpu")
         fsm.phase.copy_(torch.tensor([int(x) for x in phases], dtype=torch.long))
 
@@ -1654,7 +1667,9 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
         assert normalized.target_gripper_width_valid.tolist() == [True] * len(phases)
         assert torch.allclose(
             normalized.target_gripper_width,
-            torch.zeros(len(phases), dtype=torch.float32),
+            torch.full(
+                (len(phases),), expected_width, dtype=torch.float32
+            ),
         )
         assert context.task_meta["task"] == task_name
         assert context.task_meta["target_frame"] == "world"
@@ -1663,7 +1678,9 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
 
         selected_context = fsm.build_context(env, env_idx=[1])
         assert selected_context.phase_id.tolist() == [1]
-        assert selected_context.target_gripper_width.tolist() == [0.0]
+        assert selected_context.target_gripper_width.tolist() == pytest.approx(
+            [expected_width]
+        )
         for key in meta_keys:
             value = selected_context.task_meta[key]
             if torch.is_tensor(value):
@@ -1671,68 +1688,141 @@ def test_new_tabletop_skill_fsm_active_gripper_width_and_task_meta():
 
 
 def test_requested_task_skill_fsm_gripper_width_semantics():
-    plug_env = _PlugChargerFSMEnv(num_envs=3)
-    plug_fsm = PlugChargerSkillFSM(num_envs=3, device="cpu")
-    plug_fsm.phase.copy_(
-        torch.tensor(
+    cases = [
+        (
+            LiftPegUprightSkillFSM,
+            _LiftPegUprightFSMEnv(num_envs=5),
+            [
+                LiftPegUprightSkillPhase.PICK,
+                LiftPegUprightSkillPhase.LIFT,
+                LiftPegUprightSkillPhase.ROTATE,
+                LiftPegUprightSkillPhase.LOWER,
+                LiftPegUprightSkillPhase.DONE,
+            ],
+            [0.045, 0.045, 0.045, 0.08, float("nan")],
+        ),
+        (
+            PegInsertionSideSkillFSM,
+            _PegInsertionSideFSMEnv(num_envs=4),
+            [
+                PegInsertionSideSkillPhase.PICK,
+                PegInsertionSideSkillPhase.PRE_INSERT,
+                PegInsertionSideSkillPhase.INSERT,
+                PegInsertionSideSkillPhase.DONE,
+            ],
+            [0.025, 0.025, 0.025, float("nan")],
+        ),
+        (
+            PickCubeSkillFSM,
+            _PickCubeFSMEnv(num_envs=3),
+            [
+                PickCubeSkillPhase.PICK,
+                PickCubeSkillPhase.PLACE,
+                PickCubeSkillPhase.DONE,
+            ],
+            [0.035, 0.035, float("nan")],
+        ),
+        (
+            PlaceSphereSkillFSM,
+            _PlaceSphereFSMEnv(num_envs=4),
+            [
+                PlaceSphereSkillPhase.PICK,
+                PlaceSphereSkillPhase.PLACE,
+                PlaceSphereSkillPhase.RELEASE,
+                PlaceSphereSkillPhase.DONE,
+            ],
+            [0.035, 0.035, 0.08, float("nan")],
+        ),
+        (
+            PlugChargerSkillFSM,
+            _PlugChargerFSMEnv(num_envs=4),
             [
                 int(PlugChargerSkillPhase.PICK),
                 int(PlugChargerSkillPhase.PRE_INSERT),
                 int(PlugChargerSkillPhase.INSERT),
+                int(PlugChargerSkillPhase.DONE),
             ],
-            dtype=torch.long,
-        )
-    )
-    plug_context = normalize_skill_context(
-        plug_fsm.build_context(plug_env), num_envs=3, device="cpu"
-    )
-    assert plug_context.target_gripper_width_valid.tolist() == [True, True, True]
-    assert torch.allclose(plug_context.target_gripper_width, torch.zeros(3))
-
-    lift_env = _LiftPegUprightFSMEnv(num_envs=4)
-    lift_fsm = LiftPegUprightSkillFSM(num_envs=4, device="cpu")
-    lift_fsm.phase.copy_(
-        torch.tensor(
+            [0.025, 0.025, 0.025, float("nan")],
+        ),
+        (
+            PokeCubeSkillFSM,
+            _PokeCubeFSMEnv(num_envs=4),
             [
-                int(LiftPegUprightSkillPhase.PICK),
-                int(LiftPegUprightSkillPhase.LIFT),
-                int(LiftPegUprightSkillPhase.ROTATE),
-                int(LiftPegUprightSkillPhase.LOWER),
+                PokeCubeSkillPhase.PICK,
+                PokeCubeSkillPhase.ALIGN,
+                PokeCubeSkillPhase.PUSH,
+                PokeCubeSkillPhase.DONE,
             ],
-            dtype=torch.long,
-        )
-    )
-    lift_context = normalize_skill_context(
-        lift_fsm.build_context(lift_env), num_envs=4, device="cpu"
-    )
-    assert lift_context.target_gripper_width_valid.tolist() == [
-        False,
-        True,
-        True,
-        True,
+            [0.045, 0.045, 0.045, float("nan")],
+        ),
+        (
+            PullCubeSkillFSM,
+            _PullCubeFSMEnv(num_envs=3),
+            [
+                PullCubeSkillPhase.ALIGN,
+                PullCubeSkillPhase.PULL,
+                PullCubeSkillPhase.DONE,
+            ],
+            [0.0, 0.0, float("nan")],
+        ),
+        (
+            PullCubeToolSkillFSM,
+            _PullCubeToolFSMEnv(num_envs=4),
+            [
+                PullCubeToolSkillPhase.PICK,
+                PullCubeToolSkillPhase.ALIGN,
+                PullCubeToolSkillPhase.PULL,
+                PullCubeToolSkillPhase.DONE,
+            ],
+            [0.045, 0.045, 0.045, float("nan")],
+        ),
+        (
+            PushCubeSkillFSM,
+            _PushCubeFSMEnv(num_envs=3),
+            [
+                PushCubeSkillPhase.ALIGN,
+                PushCubeSkillPhase.PUSH,
+                PushCubeSkillPhase.DONE,
+            ],
+            [0.0, 0.0, 0.0],
+        ),
+        (
+            StackCubeSkillFSM,
+            _StackCubeFSMEnv(num_envs=3),
+            [
+                StackCubeSkillPhase.PICK,
+                StackCubeSkillPhase.PLACE,
+                StackCubeSkillPhase.DONE,
+            ],
+            [0.035, 0.035, float("nan")],
+        ),
+        (
+            StackPyramidSkillFSM,
+            _StackPyramidFSMEnv(num_envs=4),
+            [
+                StackPyramidSkillPhase.PUSH_BASE,
+                StackPyramidSkillPhase.PICK_TOP,
+                StackPyramidSkillPhase.PLACE_TOP,
+                StackPyramidSkillPhase.DONE,
+            ],
+            [0.0, 0.035, 0.08, float("nan")],
+        ),
     ]
-    assert lift_context.target_gripper_width.tolist() == [0.0, 0.0, 0.0, 0.0]
 
-    stack_env = _StackPyramidFSMEnv(num_envs=3)
-    stack_fsm = StackPyramidSkillFSM(num_envs=3, device="cpu")
-    stack_fsm.phase.copy_(
-        torch.tensor(
-            [
-                int(StackPyramidSkillPhase.PUSH_BASE),
-                int(StackPyramidSkillPhase.PICK_TOP),
-                int(StackPyramidSkillPhase.PLACE_TOP),
-            ],
-            dtype=torch.long,
+    for fsm_cls, env, phases, expected_widths in cases:
+        fsm = fsm_cls(num_envs=len(phases), device="cpu")
+        fsm.phase.copy_(torch.tensor([int(x) for x in phases], dtype=torch.long))
+        context = normalize_skill_context(
+            fsm.build_context(env), num_envs=len(phases), device="cpu"
         )
-    )
-    stack_context = normalize_skill_context(
-        stack_fsm.build_context(stack_env), num_envs=3, device="cpu"
-    )
-    assert stack_context.target_gripper_width_valid.tolist() == [True, False, True]
-    assert torch.allclose(
-        stack_context.target_gripper_width,
-        torch.tensor([0.0, 0.0, 0.08], dtype=torch.float32),
-    )
+
+        expected = torch.tensor(expected_widths, dtype=torch.float32)
+        assert torch.allclose(
+            context.target_gripper_width, torch.nan_to_num(expected)
+        )
+        assert context.target_gripper_width_valid.tolist() == torch.isfinite(
+            expected
+        ).tolist()
 
     push_t_context = PushTSkillFSM(num_envs=2, device="cpu").build_context(
         _PushTFSMEnv(num_envs=2)

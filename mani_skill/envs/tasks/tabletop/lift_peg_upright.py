@@ -304,7 +304,8 @@ class LiftPegUprightSkillFSM:
             dtype=torch.float32,
             device=phase.device,
         )
-        target_gripper_width[active] = 0.0
+        target_gripper_width[pick | lift | rotate] = 0.045
+        target_gripper_width[lower] = 0.08
 
         phase_names_by_id = {
             int(LiftPegUprightSkillPhase.PICK): "pick",
