@@ -57,6 +57,7 @@ from mani_skill.utils.skill_annotation import (
     SKILL_VOCAB,
     SkillAnnotationEpisodeRecorder,
     SkillAnnotationContext,
+    build_grasp_rect_corners_3d,
     get_annotation_bundle,
     get_annotation_bundle_for_env,
     id_to_skill,
@@ -210,13 +211,38 @@ def test_grasp_rectangle_projection_shape_and_visibility():
         extrinsic,
         (100, 100),
         gripper_width=torch.tensor([0.2]),
-        grasp_height=0.2,
+        grasp_height=0.1,
     )
 
     assert projected["grasp_rect_uv"].shape == (1, 4, 2)
     assert projected["grasp_visible"].tolist() == [True]
-    expected = torch.tensor([[[40.0, 40.0], [60.0, 40.0], [60.0, 60.0], [40.0, 60.0]]])
+    expected = torch.tensor(
+        [[[45.0, 40.0], [55.0, 40.0], [55.0, 60.0], [45.0, 60.0]]]
+    )
     assert torch.allclose(projected["grasp_rect_uv"], expected)
+
+
+def test_grasp_rectangle_uses_local_y_as_closing_axis():
+    pose = torch.eye(4)[None]
+    pose[:, :3, 3] = torch.tensor([1.0, 2.0, 3.0])
+
+    corners = build_grasp_rect_corners_3d(
+        pose,
+        gripper_width=torch.tensor([0.08]),
+        grasp_height=0.02,
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [0.99, 1.96, 3.0],
+                [1.01, 1.96, 3.0],
+                [1.01, 2.04, 3.0],
+                [0.99, 2.04, 3.0],
+            ]
+        ]
+    )
+    assert torch.allclose(corners, expected)
 
 
 def test_manager_previous_cache_falls_back_when_target_is_missing():

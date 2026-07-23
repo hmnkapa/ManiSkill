@@ -35,6 +35,13 @@ def build_grasp_rect_corners_3d(
     gripper_width: torch.Tensor | float | None = None,
     grasp_height: float = DEFAULT_GRASP_HEIGHT_M,
 ) -> torch.Tensor:
+    """Build grasp-rectangle corners using the ManiSkill TCP axis convention.
+
+    A gripper TCP pose uses local X along the fingers, local Y along the
+    gripper closing direction, and local Z along the approach direction.
+    Therefore ``gripper_width`` controls the corner separation along local Y,
+    while ``grasp_height`` controls the fixed finger extent along local X.
+    """
     pose_mat = _as_pose_matrix(target_pose_world)
     device = pose_mat.device
     dtype = pose_mat.dtype
@@ -50,17 +57,17 @@ def build_grasp_rect_corners_3d(
 
     center = pose_mat[:, :3, 3]
     rot = pose_mat[:, :3, :3]
-    open_axis = rot[:, :, 0]
-    height_axis = rot[:, :, 1]
-    half_open = 0.5 * width[:, None]
-    half_height = 0.5 * height[:, None]
+    finger_axis = rot[:, :, 0]
+    closing_axis = rot[:, :, 1]
+    half_finger_extent = 0.5 * height[:, None]
+    half_opening = 0.5 * width[:, None]
 
     return torch.stack(
         [
-            center - half_open * open_axis - half_height * height_axis,
-            center + half_open * open_axis - half_height * height_axis,
-            center + half_open * open_axis + half_height * height_axis,
-            center - half_open * open_axis + half_height * height_axis,
+            center - half_finger_extent * finger_axis - half_opening * closing_axis,
+            center + half_finger_extent * finger_axis - half_opening * closing_axis,
+            center + half_finger_extent * finger_axis + half_opening * closing_axis,
+            center - half_finger_extent * finger_axis + half_opening * closing_axis,
         ],
         dim=1,
     )
