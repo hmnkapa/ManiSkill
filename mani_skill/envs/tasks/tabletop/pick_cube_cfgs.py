@@ -83,3 +83,7 @@ PICK_CUBE_CONFIGS = {
         "human_cam_target_pos": [-0.2, 0.0, 0.2],
     },
 }
+
+# The wrist-camera Panda has identical task geometry and uses the same
+# RR-aligned fixed front camera as the standard Panda.
+PICK_CUBE_CONFIGS["panda_wristcam"] = PICK_CUBE_CONFIGS["panda"].copy()
