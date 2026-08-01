@@ -7,7 +7,13 @@ from typing import Any, Optional
 
 import numpy as np
 
-from .schema import ACTION_DIM, CameraInfo, PickleObservation, PickleTrajectory
+from .schema import (
+    ACTION_DIM,
+    CameraInfo,
+    PickleEnv,
+    PickleObservation,
+    PickleTrajectory,
+)
 
 
 class TrajectoryBuffer:
@@ -87,7 +93,7 @@ class TrajectoryBuffer:
             raise
 
     def finalize(
-        self, *, success: bool, task: str = "PickCube-v1"
+        self, *, success: bool, task: PickleEnv | str = PickleEnv.PICK_CUBE
     ) -> PickleTrajectory:
         if not self.active:
             raise RuntimeError("No active trajectory to finalize")
@@ -112,7 +118,7 @@ class TrajectoryBuffer:
                 "front_camera": deepcopy(self._front_camera_info),
             },
             "success": bool(success),
-            "task": str(task),
+            "task": task.value if isinstance(task, PickleEnv) else str(task),
             "action_type": "delta",
         }
 

@@ -12,7 +12,8 @@ import numpy as np
 
 from mani_skill.trajectory.pickle.action_adapter import CanonicalActionAdapter
 from mani_skill.trajectory.pickle.buffer import TrajectoryBuffer
-from mani_skill.trajectory.pickle.state_adapter import PickCubeStateAdapter
+from mani_skill.trajectory.pickle.state_adapter import PickleStateAdapter
+from mani_skill.trajectory.pickle.task_registry import get_pickle_task_spec
 from mani_skill.trajectory.pickle.writer import write_trajectory
 from mani_skill.utils.skill_annotation.manager import (
     get_annotation_bundle,
@@ -21,11 +22,11 @@ from mani_skill.utils.skill_annotation.manager import (
 
 
 class RecordPickle(gym.Wrapper):
-    """Record one PickCube motion-planning rollout without changing Gym I/O.
+    """Record one supported task rollout without changing Gym I/O.
 
     The wrapper never splits or writes a trajectory on ``terminated`` or
-    ``truncated``.  Motion-planning callers must explicitly call
-    :meth:`flush_episode` or :meth:`discard_episode` before the next reset.
+    ``truncated``.  Callers must explicitly call :meth:`flush_episode` or
+    :meth:`discard_episode` before the next reset.
     """
 
     def __init__(
@@ -48,13 +49,11 @@ class RecordPickle(gym.Wrapper):
         task_id = getattr(getattr(base_env, "spec", None), "id", None)
         if task_id is None:
             task_id = getattr(getattr(env, "spec", None), "id", None)
-        if task_id != "PickCube-v1":
-            raise NotImplementedError(
-                f"RecordPickle currently supports PickCube-v1 only, got {task_id!r}"
-            )
+        self.task_spec = get_pickle_task_spec(task_id)
+        self.task_id = self.task_spec.env.value
         if base_env.control_mode != "pd_joint_pos":
             raise NotImplementedError(
-                "Online motion-planning recording requires control_mode='pd_joint_pos'"
+                "Online pickle recording requires control_mode='pd_joint_pos'"
             )
         if base_env.obs_mode != "rgbd":
             raise NotImplementedError(
@@ -67,7 +66,7 @@ class RecordPickle(gym.Wrapper):
         self.use_previous_annotations = bool(use_previous_annotations)
         self.buffer = TrajectoryBuffer()
         self.action_adapter = CanonicalActionAdapter(env)
-        self.state_adapter = PickCubeStateAdapter(env)
+        self.state_adapter = PickleStateAdapter(env)
         self._last_info: Optional[dict[str, Any]] = None
 
     def reset(self, **kwargs):
@@ -102,7 +101,9 @@ class RecordPickle(gym.Wrapper):
 
         if success is None:
             success = self._infer_success()
-        trajectory = self.buffer.finalize(success=bool(success), task="PickCube-v1")
+        trajectory = self.buffer.finalize(
+            success=bool(success), task=self.task_id
+        )
         status = "success" if success else "failure"
         suffix = ".pkl.xz" if self.compress else ".pkl"
         timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S.%f")

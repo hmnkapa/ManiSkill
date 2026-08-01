@@ -5,7 +5,7 @@ import numpy as np
 import sapien
 import torch
 
-from mani_skill.agents.robots import Fetch, Panda
+from mani_skill.agents.robots import Fetch, Panda, PandaWristCam
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
@@ -295,9 +295,9 @@ class PullCubeToolEnv(BaseEnv):
 
     _sample_video_link = "https://github.com/mani-skill/ManiSkill/raw/main/figures/environment_demos/PullCubeTool-v1_rt.mp4"
 
-    SUPPORTED_ROBOTS = ["panda", "fetch"]
+    SUPPORTED_ROBOTS = ["panda", "panda_wristcam", "fetch"]
     SUPPORTED_REWARD_MODES = ("normalized_dense", "dense", "sparse", "none")
-    agent: Union[Panda, Fetch]
+    agent: Union[Panda, PandaWristCam, Fetch]
 
     goal_radius = 0.3
     cube_half_size = 0.02

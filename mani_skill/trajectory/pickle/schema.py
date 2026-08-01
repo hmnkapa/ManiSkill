@@ -15,9 +15,19 @@ import numpy as np
 
 
 class PickleEnv(str, Enum):
-    """Tasks supported by the first pickle recorder implementation."""
+    """ManiSkill tasks supported by RR-compatible pickle recording."""
 
+    LIFT_PEG_UPRIGHT = "LiftPegUpright-v1"
+    PEG_INSERTION_SIDE = "PegInsertionSide-v1"
     PICK_CUBE = "PickCube-v1"
+    PLACE_SPHERE = "PlaceSphere-v1"
+    PLUG_CHARGER = "PlugCharger-v1"
+    POKE_CUBE = "PokeCube-v1"
+    PULL_CUBE = "PullCube-v1"
+    PULL_CUBE_TOOL = "PullCubeTool-v1"
+    PUSH_CUBE = "PushCube-v1"
+    STACK_CUBE = "StackCube-v1"
+    STACK_PYRAMID = "StackPyramid-v1"
 
 
 ACTION_DIM = 8

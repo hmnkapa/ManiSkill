@@ -4,12 +4,19 @@ from .schema import (
     ACTION_DIM,
     ACTION_FIELDS,
     CAMERA_TO_IMAGE_KEYS,
+    PART_POSE_DIM,
     PICK_CUBE_PART_NAMES,
     CameraInfo,
     PickleEnv,
     PickleObservation,
     PickleTrajectory,
     RobotState,
+)
+from .task_registry import (
+    PICKLE_TASK_SPECS,
+    PartPoseSource,
+    PickleTaskSpec,
+    get_pickle_task_spec,
 )
 from .validator import TrajectoryValidationError, validate_trajectory
 from .writer import read_trajectory, write_trajectory
@@ -18,13 +25,18 @@ __all__ = [
     "ACTION_DIM",
     "ACTION_FIELDS",
     "CAMERA_TO_IMAGE_KEYS",
+    "PART_POSE_DIM",
+    "PICKLE_TASK_SPECS",
     "PICK_CUBE_PART_NAMES",
     "CameraInfo",
+    "PartPoseSource",
     "PickleEnv",
     "PickleObservation",
+    "PickleTaskSpec",
     "PickleTrajectory",
     "RobotState",
     "TrajectoryValidationError",
+    "get_pickle_task_spec",
     "read_trajectory",
     "validate_trajectory",
     "write_trajectory",

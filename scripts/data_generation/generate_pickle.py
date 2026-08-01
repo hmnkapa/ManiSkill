@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate RR-compatible PickCube pickles with the motion planner."""
+"""Generate RR-compatible task pickles with Panda motion planners."""
 
 from __future__ import annotations
 
@@ -11,13 +11,46 @@ import gymnasium as gym
 import numpy as np
 
 import mani_skill.envs  # noqa: F401 - register ManiSkill Gym environments
-from mani_skill.examples.motionplanning.panda.solutions import solvePickCube
+from mani_skill.examples.motionplanning.panda.solutions import (
+    solveLiftPegUpright,
+    solvePegInsertionSide,
+    solvePickCube,
+    solvePlaceSphere,
+    solvePlugCharger,
+    solvePullCube,
+    solvePullCubeTool,
+    solvePushCube,
+    solveStackCube,
+    solveStackPyramid,
+)
+from mani_skill.trajectory.pickle import PickleEnv
 from mani_skill.utils.wrappers import RecordPickle
+
+
+MOTION_PLANNING_SOLVERS = {
+    PickleEnv.LIFT_PEG_UPRIGHT.value: solveLiftPegUpright,
+    PickleEnv.PEG_INSERTION_SIDE.value: solvePegInsertionSide,
+    PickleEnv.PICK_CUBE.value: solvePickCube,
+    PickleEnv.PLACE_SPHERE.value: solvePlaceSphere,
+    PickleEnv.PLUG_CHARGER.value: solvePlugCharger,
+    PickleEnv.PULL_CUBE.value: solvePullCube,
+    PickleEnv.PULL_CUBE_TOOL.value: solvePullCubeTool,
+    PickleEnv.PUSH_CUBE.value: solvePushCube,
+    PickleEnv.STACK_CUBE.value: solveStackCube,
+    PickleEnv.STACK_PYRAMID.value: solveStackPyramid,
+}
 
 
 def parse_args(args=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate PickCube-v1 motion-planning trajectories in RR pickle format."
+        description="Generate Panda motion-planning trajectories in RR pickle format."
+    )
+    parser.add_argument(
+        "-e",
+        "--env-id",
+        choices=tuple(env.value for env in PickleEnv),
+        default=PickleEnv.PICK_CUBE.value,
+        help="Task to record. PokeCube-v1 is recordable but has no bundled solver.",
     )
     parser.add_argument(
         "--num-traj",
@@ -59,6 +92,11 @@ def parse_args(args=None) -> argparse.Namespace:
         parser.error("--num-traj must be positive")
     if parsed.max_attempts is not None and parsed.max_attempts <= 0:
         parser.error("--max-attempts must be positive when provided")
+    if parsed.env_id not in MOTION_PLANNING_SOLVERS:
+        parser.error(
+            f"{parsed.env_id} supports RecordPickle, but no Panda motion-planning "
+            "solver is available; use RecordPickle with another rollout source"
+        )
     return parsed
 
 
@@ -83,11 +121,16 @@ def _planning_success(result: Any) -> bool:
 
 
 def generate(args: argparse.Namespace) -> list[Path]:
-    output_dir = (
-        args.record_dir / "PickCube-v1" / "motionplanning_pickle"
-    )
+    env_id = str(args.env_id)
+    if env_id not in MOTION_PLANNING_SOLVERS:
+        raise NotImplementedError(
+            f"{env_id} supports RecordPickle, but no Panda motion-planning "
+            "solver is available; use RecordPickle with another rollout source"
+        )
+    solve = MOTION_PLANNING_SOLVERS[env_id]
+    output_dir = args.record_dir / env_id / "motionplanning_pickle"
     env = gym.make(
-        "PickCube-v1",
+        env_id,
         num_envs=1,
         obs_mode="rgbd",
         control_mode="pd_joint_pos",
@@ -116,9 +159,7 @@ def generate(args: argparse.Namespace) -> list[Path]:
                 )
             attempts += 1
             try:
-                result = solvePickCube(
-                    recorder, seed=seed, debug=False, vis=bool(args.vis)
-                )
+                result = solve(recorder, seed=seed, debug=False, vis=bool(args.vis))
                 success = _planning_success(result)
             except Exception as error:
                 success = False
@@ -145,7 +186,9 @@ def generate(args: argparse.Namespace) -> list[Path]:
 def main(args=None) -> int:
     parsed = parse_args(args)
     saved = generate(parsed)
-    print(f"Generated {len(saved)} successful PickCube pickle trajectories.")
+    print(
+        f"Generated {len(saved)} successful {parsed.env_id} pickle trajectories."
+    )
     return 0
 
 

@@ -13,11 +13,11 @@ from .schema import (
     IMAGE_HEIGHT,
     IMAGE_WIDTH,
     OBSERVATION_KEYS,
-    PICK_CUBE_PART_NAMES,
     ROBOT_STATE_KEYS,
     TRAJECTORY_KEYS,
     PickleEnv,
 )
+from .task_registry import PickleTaskSpec, get_pickle_task_spec
 from .transforms import normalize_quaternion_xyzw
 
 
@@ -248,7 +248,9 @@ def _validate_annotations(observation: Mapping, path: str) -> None:
         )
 
 
-def _validate_observation(observation: Any, index: int) -> None:
+def _validate_observation(
+    observation: Any, index: int, task_spec: PickleTaskSpec
+) -> None:
     path = f"observations[{index}]"
     observation = _exact_keys(observation, OBSERVATION_KEYS, path)
     _validate_robot_state(observation["robot_state"], f"{path}.robot_state")
@@ -271,7 +273,7 @@ def _validate_observation(observation: Any, index: int) -> None:
             _fail(f"{path}.{key}", "depth in metres cannot be negative")
     parts = _array(
         observation["parts_poses"],
-        (len(PICK_CUBE_PART_NAMES) * 7,),
+        (task_spec.parts_pose_dim,),
         np.float32,
         f"{path}.parts_poses",
     ).reshape((-1, 7))
@@ -325,18 +327,14 @@ def _validate_camera_info(camera_info: Any) -> None:
 
 
 def validate_trajectory(
-    trajectory: Any, env: PickleEnv | str = PickleEnv.PICK_CUBE
+    trajectory: Any, env: PickleEnv | str | None = None
 ) -> None:
-    """Validate the complete, strict RR raw-rollout contract."""
-
-    try:
-        env = PickleEnv(env)
-    except ValueError as error:
-        raise NotImplementedError(f"Unsupported pickle environment: {env!r}") from error
-    if env is not PickleEnv.PICK_CUBE:
-        raise NotImplementedError(f"Unsupported pickle environment: {env.value}")
+    """Validate the strict RR contract, inferring the task when omitted."""
 
     trajectory = _exact_keys(trajectory, TRAJECTORY_KEYS, "trajectory")
+    task_spec = get_pickle_task_spec(
+        trajectory["task"] if env is None else env
+    )
     observations = trajectory["observations"]
     actions = trajectory["actions"]
     rewards = trajectory["rewards"]
@@ -372,12 +370,15 @@ def validate_trajectory(
         _fail("rewards", "must contain T finite scalar values")
 
     for index, observation in enumerate(observations):
-        _validate_observation(observation, index)
+        _validate_observation(observation, index, task_spec)
     _validate_camera_info(trajectory["camera_info"])
     if type(trajectory["success"]) is not bool:
         _fail("success", "must be a Python bool")
-    if trajectory["task"] != env.value:
-        _fail("task", f"expected {env.value!r}, got {trajectory['task']!r}")
+    if trajectory["task"] != task_spec.env.value:
+        _fail(
+            "task",
+            f"expected {task_spec.env.value!r}, got {trajectory['task']!r}",
+        )
     if trajectory["action_type"] != "delta":
         _fail("action_type", "expected 'delta'")
 

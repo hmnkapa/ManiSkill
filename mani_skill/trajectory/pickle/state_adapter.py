@@ -10,12 +10,12 @@ from .schema import (
     CAMERA_TO_IMAGE_KEYS,
     IMAGE_HEIGHT,
     IMAGE_WIDTH,
-    PICK_CUBE_PART_NAMES,
     CameraInfo,
     GraspAnnotation2D,
     PickleObservation,
     RobotState,
 )
+from .task_registry import get_pickle_task_spec
 from .transforms import (
     as_numpy,
     matrix_to_pose,
@@ -26,7 +26,7 @@ from .transforms import (
 )
 
 
-class PickCubeStateAdapter:
+class PickleStateAdapter:
     """Capture a single fixed-base Panda observation in its base frame."""
 
     def __init__(self, env):
@@ -41,11 +41,23 @@ class PickCubeStateAdapter:
             raise NotImplementedError(
                 "Pickle state recording currently supports fixed-base Panda only"
             )
-        if not hasattr(self.base_env, "cube") or not hasattr(
-            self.base_env, "goal_site"
-        ):
+        task_id = getattr(getattr(self.base_env, "spec", None), "id", None)
+        if task_id is None:
+            task_id = getattr(getattr(env, "spec", None), "id", None)
+        self.task_spec = get_pickle_task_spec(task_id)
+        missing_parts = [
+            part
+            for part in self.task_spec.parts
+            if not hasattr(self.base_env, part.env_attribute)
+            or not hasattr(getattr(self.base_env, part.env_attribute), "pose")
+        ]
+        if missing_parts:
+            missing = ", ".join(
+                f"{part.name} (env.{part.env_attribute})" for part in missing_parts
+            )
             raise NotImplementedError(
-                "PickCube state recording requires cube and goal_site actors"
+                f"{self.task_spec.env.value} pickle state recording is missing "
+                f"required task entities: {missing}"
             )
         self.agent = self.base_env.agent
 
@@ -162,10 +174,10 @@ class PickCubeStateAdapter:
 
     def _parts_poses(self, world_base: np.ndarray) -> np.ndarray:
         parts = []
-        for name in PICK_CUBE_PART_NAMES:
-            actor = getattr(self.base_env, name)
+        for part in self.task_spec.parts:
+            actor = getattr(self.base_env, part.env_attribute)
             world_part = self._single_matrix(
-                actor.pose.to_transformation_matrix(), f"{name} pose"
+                actor.pose.to_transformation_matrix(), f"{part.name} pose"
             )
             part_position, part_quaternion = matrix_to_pose(
                 world_pose_to_base(world_part, world_base)
@@ -212,8 +224,13 @@ class PickCubeStateAdapter:
             depth = depth[..., 0]
         if depth.shape != (IMAGE_HEIGHT, IMAGE_WIDTH):
             raise ValueError(f"{camera_name} depth must be 224x224, got {depth.shape}")
-        # Standard ManiSkill RGB-D cameras encode depth in millimetres.
-        depth = depth.astype(np.float32) / np.float32(1000.0)
+        # Standard ManiSkill RGB-D cameras encode depth in millimetres.  The
+        # minimal shader stores camera positions in signed 16-bit textures, so
+        # invalid/no-hit pixels can appear negative after its depth transform.
+        # RR uses zero for invalid depth and metres for valid measurements.
+        depth = depth.astype(np.float32)
+        depth[depth < 0] = 0
+        depth /= np.float32(1000.0)
         if not np.isfinite(depth).all():
             raise ValueError(f"{camera_name} depth contains a non-finite value")
         return color.copy(), depth.copy()
@@ -340,7 +357,7 @@ class PickCubeStateAdapter:
 
     @staticmethod
     def _single_vector(value: Any, name: str) -> np.ndarray:
-        return PickCubeStateAdapter._single_vector_size(value, 3, name)
+        return PickleStateAdapter._single_vector_size(value, 3, name)
 
     @staticmethod
     def _single_vector_size(value: Any, size: int, name: str) -> np.ndarray:
@@ -353,7 +370,7 @@ class PickCubeStateAdapter:
 
     @staticmethod
     def _single_matrix(value: Any, name: str) -> np.ndarray:
-        return PickCubeStateAdapter._single_matrix_shape(value, (4, 4), name)
+        return PickleStateAdapter._single_matrix_shape(value, (4, 4), name)
 
     @staticmethod
     def _single_matrix_shape(value: Any, shape: tuple[int, int], name: str) -> np.ndarray:
@@ -394,4 +411,8 @@ class PickCubeStateAdapter:
         return bool(array[0]) if array.size else False
 
 
-__all__ = ["PickCubeStateAdapter"]
+PickCubeStateAdapter = PickleStateAdapter
+"""Backward-compatible alias for the original PickCube-only adapter name."""
+
+
+__all__ = ["PickCubeStateAdapter", "PickleStateAdapter"]

@@ -6,7 +6,7 @@ import sapien
 import torch
 from transforms3d.euler import euler2quat
 
-from mani_skill.agents.robots import Fetch, Panda
+from mani_skill.agents.robots import Fetch, Panda, PandaWristCam
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
@@ -234,8 +234,8 @@ class PokeCubeEnv(BaseEnv):
     """
 
     _sample_video_link = "https://github.com/mani-skill/ManiSkill/raw/main/figures/environment_demos/PokeCube-v1_rt.mp4"
-    SUPPORTED_ROBOTS = ["panda", "fetch"]
-    agent: Union[Panda, Fetch]
+    SUPPORTED_ROBOTS = ["panda", "panda_wristcam", "fetch"]
+    agent: Union[Panda, PandaWristCam, Fetch]
 
     cube_half_size = 0.02
     peg_half_width = 0.025
