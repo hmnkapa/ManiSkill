@@ -215,6 +215,11 @@ class PickCubeEnv(BaseEnv):
         self.max_goal_height = cfg["max_goal_height"]
         self.sensor_cam_eye_pos = cfg["sensor_cam_eye_pos"]
         self.sensor_cam_target_pos = cfg["sensor_cam_target_pos"]
+        self.sensor_cam_width = cfg.get("sensor_cam_width", 128)
+        self.sensor_cam_height = cfg.get("sensor_cam_height", 128)
+        self.sensor_cam_fov = cfg.get("sensor_cam_fov", np.pi / 2)
+        self.sensor_cam_near = cfg.get("sensor_cam_near", 0.01)
+        self.sensor_cam_far = cfg.get("sensor_cam_far", 100)
         self.human_cam_eye_pos = cfg["human_cam_eye_pos"]
         self.human_cam_target_pos = cfg["human_cam_target_pos"]
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
@@ -224,7 +229,17 @@ class PickCubeEnv(BaseEnv):
         pose = sapien_utils.look_at(
             eye=self.sensor_cam_eye_pos, target=self.sensor_cam_target_pos
         )
-        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+        return [
+            CameraConfig(
+                "base_camera",
+                pose,
+                self.sensor_cam_width,
+                self.sensor_cam_height,
+                self.sensor_cam_fov,
+                self.sensor_cam_near,
+                self.sensor_cam_far,
+            )
+        ]
 
     @property
     def _default_human_render_camera_configs(self):
