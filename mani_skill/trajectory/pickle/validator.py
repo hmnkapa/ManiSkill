@@ -14,6 +14,7 @@ from .schema import (
     IMAGE_WIDTH,
     OBSERVATION_KEYS,
     ROBOT_STATE_KEYS,
+    SOURCE_ENV,
     TRAJECTORY_KEYS,
     PickleEnv,
 )
@@ -381,6 +382,8 @@ def validate_trajectory(
         )
     if trajectory["action_type"] != "delta":
         _fail("action_type", "expected 'delta'")
+    if trajectory["env"] != SOURCE_ENV:
+        _fail("env", f"expected {SOURCE_ENV!r}, got {trajectory['env']!r}")
 
 
 __all__ = ["TrajectoryValidationError", "validate_trajectory"]

@@ -19,7 +19,7 @@ from mani_skill.trajectory.pickle.action_adapter import (
     native_gripper_to_canonical,
 )
 from mani_skill.trajectory.pickle.buffer import TrajectoryBuffer
-from mani_skill.trajectory.pickle.schema import PickleEnv
+from mani_skill.trajectory.pickle.schema import PickleEnv, SOURCE_ENV
 from mani_skill.trajectory.pickle.state_adapter import (
     PickCubeStateAdapter,
     PickleStateAdapter,
@@ -365,6 +365,7 @@ def test_buffer_t_plus_one_and_reset_guard():
     assert len(result["observations"]) == 2
     assert len(result["actions"]) == len(result["rewards"]) == 1
     assert result["task"] == PickleEnv.PICK_CUBE.value
+    assert result["env"] == SOURCE_ENV
     assert isinstance(result["actions"], list)
     assert isinstance(result["rewards"], list)
     validate_trajectory(result)
@@ -379,6 +380,11 @@ def test_validator_rejects_schema_and_quaternion_errors():
     trajectory = _trajectory()
     trajectory["actions"][0][3:7] = [0, 0, 0, 2]
     with pytest.raises(TrajectoryValidationError, match="unit quaternion"):
+        validate_trajectory(trajectory)
+
+    trajectory = _trajectory()
+    trajectory["env"] = "OtherSimulator"
+    with pytest.raises(TrajectoryValidationError, match="expected 'ManiSkill'"):
         validate_trajectory(trajectory)
 
 

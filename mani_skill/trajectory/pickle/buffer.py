@@ -13,6 +13,7 @@ from .schema import (
     PickleEnv,
     PickleObservation,
     PickleTrajectory,
+    SOURCE_ENV,
 )
 
 
@@ -120,6 +121,7 @@ class TrajectoryBuffer:
             "success": bool(success),
             "task": task.value if isinstance(task, PickleEnv) else str(task),
             "action_type": "delta",
+            "env": SOURCE_ENV,
         }
 
     def clear(self) -> None:

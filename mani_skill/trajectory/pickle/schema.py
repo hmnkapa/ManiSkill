@@ -34,6 +34,7 @@ ACTION_DIM = 8
 PART_POSE_DIM = 7
 IMAGE_HEIGHT = 224
 IMAGE_WIDTH = 224
+SOURCE_ENV = "ManiSkill"
 
 ACTION_FIELDS = (
     "delta_x",
@@ -108,6 +109,7 @@ TRAJECTORY_KEYS = (
     "success",
     "task",
     "action_type",
+    "env",
 )
 
 
@@ -174,6 +176,7 @@ class PickleTrajectory(TypedDict):
     success: bool
     task: str
     action_type: str
+    env: str
 
 
 SchemaMapping = dict[str, Any]
@@ -197,5 +200,6 @@ __all__ = [
     "PickleTrajectory",
     "ROBOT_STATE_KEYS",
     "RobotState",
+    "SOURCE_ENV",
     "TRAJECTORY_KEYS",
 ]

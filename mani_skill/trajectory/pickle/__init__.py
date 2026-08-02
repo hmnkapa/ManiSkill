@@ -11,6 +11,7 @@ from .schema import (
     PickleObservation,
     PickleTrajectory,
     RobotState,
+    SOURCE_ENV,
 )
 from .task_registry import (
     PICKLE_TASK_SPECS,
@@ -35,6 +36,7 @@ __all__ = [
     "PickleTaskSpec",
     "PickleTrajectory",
     "RobotState",
+    "SOURCE_ENV",
     "TrajectoryValidationError",
     "get_pickle_task_spec",
     "read_trajectory",
