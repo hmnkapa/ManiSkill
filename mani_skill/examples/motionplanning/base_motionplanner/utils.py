@@ -9,12 +9,37 @@ from mani_skill.utils import common
 from mani_skill.utils.geometry.trimesh_utils import get_component_mesh
 
 
+def _actor_world_transform(actor: Actor) -> np.ndarray:
+    """Return the first scene actor's live world transform.
+
+    ``PhysxRigidBaseComponent.pose`` is not synchronized with tensorized actor
+    resets on the GPU backend.  The ManiSkill ``Actor`` wrapper owns the live
+    batched pose, so motion-planning geometry must read the transform from it.
+    ``actor._objs[0]`` below refers to the same first scene instance.
+    """
+
+    transform = actor.pose.to_transformation_matrix()
+    if hasattr(transform, "detach"):
+        transform = transform.detach().cpu().numpy()
+    transform = np.asarray(transform, dtype=np.float64)
+    if transform.shape == (1, 4, 4):
+        transform = transform[0]
+    if transform.shape != (4, 4):
+        raise ValueError(
+            "get_actor_obb expects one actor instance, got pose matrix shape "
+            f"{transform.shape}"
+        )
+    return transform
+
+
 def get_actor_obb(actor: Actor, to_world_frame=True, vis=False):
     mesh = get_component_mesh(
         actor._objs[0].find_component_by_type(physx.PhysxRigidDynamicComponent),
-        to_world_frame=to_world_frame,
+        to_world_frame=False,
     )
     assert mesh is not None, "can not get actor mesh for {}".format(actor)
+    if to_world_frame:
+        mesh.apply_transform(_actor_world_transform(actor))
 
     obb: trimesh.primitives.Box = mesh.bounding_box_oriented
 

@@ -875,6 +875,14 @@ def test_lift_peg_upright_skill_fsm_transitions_through_place_stages():
     fsm = LiftPegUprightSkillFSM(num_envs=1, device="cpu")
 
     assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.PICK)]
+    pick_context = fsm.build_context(env)
+    pick_target_pose = pick_context.target_pose_world.clone()
+    env.agent.tcp = _ActorStub(
+        torch.tensor([[0.04, -0.03, 0.18]], dtype=torch.float32),
+        torch.tensor([[0.70710677, 0.0, 0.0, 0.70710677]], dtype=torch.float32),
+    )
+    pick_context = fsm.build_context(env)
+    assert torch.allclose(pick_context.target_pose_world, pick_target_pose, atol=1e-5)
 
     env.set_grasped(True)
     fsm.update(env)
@@ -886,6 +894,15 @@ def test_lift_peg_upright_skill_fsm_transitions_through_place_stages():
     assert torch.allclose(context.task_meta["safe_peg_height"], torch.tensor([0.22]))
     assert torch.allclose(context.task_meta["lift_height_error"], torch.tensor([0.22]))
     assert context.task_meta["is_lifted"].tolist() == [False]
+    lift_target_pose = context.target_pose_world.clone()
+
+    env.agent.set_tcp_pos(torch.tensor([[0.03, -0.02, 0.04]]))
+    env.peg.set_pose(
+        torch.tensor([[0.03, -0.02, 0.04]], dtype=torch.float32),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+    )
+    context = fsm.build_context(env)
+    assert torch.allclose(context.target_pose_world, lift_target_pose, atol=1e-5)
 
     fsm.update(env)
     assert fsm.phase.tolist() == [int(LiftPegUprightSkillPhase.LIFT)]
@@ -971,6 +988,86 @@ def test_lift_peg_upright_skill_fsm_transitions_through_place_stages():
     ]
 
 
+def test_lift_peg_upright_reset_suppresses_one_stale_grasp_transition():
+    env = _LiftPegUprightFSMEnv(num_envs=2)
+    fsm = LiftPegUprightSkillFSM(num_envs=2, device="cpu")
+    env.set_grasped([True, True])
+    fsm.phase.fill_(int(LiftPegUprightSkillPhase.DONE))
+
+    fsm.reset(env_idx=[1])
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(LiftPegUprightSkillPhase.DONE),
+        int(LiftPegUprightSkillPhase.PICK),
+    ]
+
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(LiftPegUprightSkillPhase.DONE),
+        int(LiftPegUprightSkillPhase.LIFT),
+    ]
+
+
+def test_pick_cube_reset_suppresses_one_stale_grasp_transition():
+    env = _PickCubeFSMEnv(num_envs=2)
+    fsm = PickCubeSkillFSM(num_envs=2, device="cpu")
+    env.set_info(is_grasped=[True, True])
+    fsm.phase.fill_(int(PickCubeSkillPhase.DONE))
+
+    fsm.reset(env_idx=[1])
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PickCubeSkillPhase.DONE),
+        int(PickCubeSkillPhase.PICK),
+    ]
+
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PickCubeSkillPhase.DONE),
+        int(PickCubeSkillPhase.PLACE),
+    ]
+
+
+def test_poke_cube_reset_suppresses_one_stale_grasp_transition():
+    env = _PokeCubeFSMEnv(num_envs=2)
+    fsm = PokeCubeSkillFSM(num_envs=2, device="cpu")
+    env.set_info(is_peg_grasped=[True, True])
+    fsm.phase.fill_(int(PokeCubeSkillPhase.DONE))
+
+    fsm.reset(env_idx=[1])
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PokeCubeSkillPhase.DONE),
+        int(PokeCubeSkillPhase.PICK),
+    ]
+
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PokeCubeSkillPhase.DONE),
+        int(PokeCubeSkillPhase.ALIGN),
+    ]
+
+
+def test_pull_cube_tool_reset_suppresses_one_stale_grasp_transition():
+    env = _PullCubeToolFSMEnv(num_envs=2)
+    fsm = PullCubeToolSkillFSM(num_envs=2, device="cpu")
+    env.set_tool_grasped([True, True])
+    fsm.phase.fill_(int(PullCubeToolSkillPhase.DONE))
+
+    fsm.reset(env_idx=[1])
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PullCubeToolSkillPhase.DONE),
+        int(PullCubeToolSkillPhase.PICK),
+    ]
+
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PullCubeToolSkillPhase.DONE),
+        int(PullCubeToolSkillPhase.ALIGN),
+    ]
+
+
 def test_plug_charger_skill_fsm_transitions_through_insert():
     env = _PlugChargerFSMEnv()
     fsm = PlugChargerSkillFSM(num_envs=1, device="cpu")
@@ -1012,6 +1109,26 @@ def test_plug_charger_skill_fsm_transitions_through_insert():
     fsm.update(env, env_idx=[1])
     assert fsm.phase.tolist() == [
         int(PlugChargerSkillPhase.PICK),
+        int(PlugChargerSkillPhase.PRE_INSERT),
+    ]
+
+
+def test_plug_charger_reset_suppresses_one_stale_grasp_transition():
+    env = _PlugChargerFSMEnv(num_envs=2)
+    fsm = PlugChargerSkillFSM(num_envs=2, device="cpu")
+    env.set_grasped([True, True])
+    fsm.phase.fill_(int(PlugChargerSkillPhase.DONE))
+
+    fsm.reset(env_idx=[1])
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PlugChargerSkillPhase.DONE),
+        int(PlugChargerSkillPhase.PICK),
+    ]
+
+    fsm.update(env, env_idx=[1])
+    assert fsm.phase.tolist() == [
+        int(PlugChargerSkillPhase.DONE),
         int(PlugChargerSkillPhase.PRE_INSERT),
     ]
 

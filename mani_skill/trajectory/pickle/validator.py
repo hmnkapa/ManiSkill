@@ -9,8 +9,10 @@ import numpy as np
 
 from .schema import (
     ACTION_DIM,
+    ANNOTATION_SOURCE,
     CAMERA_INFO_KEYS,
     IMAGE_HEIGHT,
+    IMAGE_ANNOTATION_MODE,
     IMAGE_WIDTH,
     OBSERVATION_KEYS,
     ROBOT_STATE_KEYS,
@@ -143,14 +145,24 @@ def _validate_robot_state(robot_state: Any, path: str) -> None:
     _array(
         state["joint_torques"], (9,), np.float32, f"{path}.joint_torques"
     )
-    width = _scalar(state["gripper_width"], f"{path}.gripper_width", nonnegative=True)
-    finger1 = _scalar(
-        state["gripper_finger_1_pos"], f"{path}.gripper_finger_1_pos"
+    width = _array(
+        state["gripper_width"], (1,), np.float32, f"{path}.gripper_width"
     )
-    finger2 = _scalar(
-        state["gripper_finger_2_pos"], f"{path}.gripper_finger_2_pos"
+    finger1 = _array(
+        state["gripper_finger_1_pos"],
+        (1,),
+        np.float32,
+        f"{path}.gripper_finger_1_pos",
     )
-    if not np.isclose(width, finger1 + finger2, atol=1e-6, rtol=0.0):
+    finger2 = _array(
+        state["gripper_finger_2_pos"],
+        (1,),
+        np.float32,
+        f"{path}.gripper_finger_2_pos",
+    )
+    if np.any(width < -1e-7):
+        _fail(f"{path}.gripper_width", "expected nonnegative width")
+    if not np.allclose(width, finger1 + finger2, atol=1e-6, rtol=0.0):
         _fail(path, "gripper_width must equal the sum of both finger positions")
 
 
@@ -173,6 +185,10 @@ def _validate_annotations(observation: Mapping, path: str) -> None:
         (3,),
         f"{path}.guidance_point_clean",
     )
+    if skill is not None and observation["guidance_point"] is None:
+        _fail(
+            f"{path}.guidance_point", "active skill requires a scripted 3D point"
+        )
     for key in ("guidance_pose", "guidance_pose_clean"):
         if observation[key] is not None:
             _rigid_pose(observation[key], f"{path}.{key}")
@@ -206,6 +222,11 @@ def _validate_annotations(observation: Mapping, path: str) -> None:
         image_keys,
         f"{path}.grasp_annotation_2d",
     )
+    if skill is not None and points["color_image2"] is None:
+        _fail(
+            f"{path}.guidance_point_2d.color_image2",
+            "active skill requires a visible front scripted point",
+        )
     for image_key in image_keys:
         point = points[image_key]
         if point is not None:
@@ -384,6 +405,18 @@ def validate_trajectory(
         _fail("action_type", "expected 'delta'")
     if trajectory["env"] != SOURCE_ENV:
         _fail("env", f"expected {SOURCE_ENV!r}, got {trajectory['env']!r}")
+    if trajectory["annotation_source"] != ANNOTATION_SOURCE:
+        _fail(
+            "annotation_source",
+            f"expected {ANNOTATION_SOURCE!r}, got "
+            f"{trajectory['annotation_source']!r}",
+        )
+    if trajectory["image_annotation_mode"] != IMAGE_ANNOTATION_MODE:
+        _fail(
+            "image_annotation_mode",
+            f"expected {IMAGE_ANNOTATION_MODE!r}, got "
+            f"{trajectory['image_annotation_mode']!r}",
+        )
 
 
 __all__ = ["TrajectoryValidationError", "validate_trajectory"]

@@ -57,6 +57,9 @@ class PickCubeSkillFSM:
             dtype=torch.long,
             device=device,
         )
+        self._suppress_transition_once = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
+        )
 
     def _normalize_env_idx(self, env_idx=None):
         if env_idx is None:
@@ -77,8 +80,10 @@ class PickCubeSkillFSM:
         env_idx = self._normalize_env_idx(env_idx)
         if env_idx is None:
             self.phase.fill_(int(PickCubeSkillPhase.PICK))
+            self._suppress_transition_once.fill_(True)
         else:
             self.phase[env_idx] = int(PickCubeSkillPhase.PICK)
+            self._suppress_transition_once[env_idx] = True
 
     def update(self, env, env_idx=None):
         env_idx = self._normalize_env_idx(env_idx)
@@ -92,17 +97,24 @@ class PickCubeSkillFSM:
             phase = self.phase[env_idx].clone()
             is_grasped = is_grasped[env_idx]
             success = success[env_idx]
+        suppress_transition_once = self._select(
+            self._suppress_transition_once, env_idx
+        )
 
         pick = phase == int(PickCubeSkillPhase.PICK)
         place = phase == int(PickCubeSkillPhase.PLACE)
-        phase[pick & is_grasped] = int(PickCubeSkillPhase.PLACE)
+        phase[pick & is_grasped & ~suppress_transition_once] = int(
+            PickCubeSkillPhase.PLACE
+        )
         phase[place & success] = int(PickCubeSkillPhase.DONE)
         phase[place & ~is_grasped & ~success] = int(PickCubeSkillPhase.PICK)
 
         if env_idx is None:
             self.phase.copy_(phase)
+            self._suppress_transition_once.fill_(False)
         else:
             self.phase[env_idx] = phase
+            self._suppress_transition_once[env_idx] = False
 
     def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
         env_idx = self._normalize_env_idx(env_idx)

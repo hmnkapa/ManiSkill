@@ -38,6 +38,9 @@ class PlugChargerSkillFSM:
             dtype=torch.long,
             device=device,
         )
+        self._suppress_transition_once = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
+        )
 
     def _normalize_env_idx(self, env_idx=None):
         if env_idx is None:
@@ -103,8 +106,10 @@ class PlugChargerSkillFSM:
         env_idx = self._normalize_env_idx(env_idx)
         if env_idx is None:
             self.phase.fill_(int(PlugChargerSkillPhase.PICK))
+            self._suppress_transition_once.fill_(True)
         else:
             self.phase[env_idx] = int(PlugChargerSkillPhase.PICK)
+            self._suppress_transition_once[env_idx] = True
 
     def update(self, env, env_idx=None):
         env_idx = self._normalize_env_idx(env_idx)
@@ -117,11 +122,16 @@ class PlugChargerSkillFSM:
             phase = self.phase.clone()
         else:
             phase = self.phase[env_idx].clone()
+        suppress_transition_once = self._select(
+            self._suppress_transition_once, env_idx
+        )
 
         pick = phase == int(PlugChargerSkillPhase.PICK)
         pre_insert = phase == int(PlugChargerSkillPhase.PRE_INSERT)
         insert = phase == int(PlugChargerSkillPhase.INSERT)
-        phase[pick & is_grasped] = int(PlugChargerSkillPhase.PRE_INSERT)
+        phase[pick & is_grasped & ~suppress_transition_once] = int(
+            PlugChargerSkillPhase.PRE_INSERT
+        )
         phase[pre_insert & is_grasped & pre_inserted] = int(
             PlugChargerSkillPhase.INSERT
         )
@@ -129,8 +139,10 @@ class PlugChargerSkillFSM:
 
         if env_idx is None:
             self.phase.copy_(phase)
+            self._suppress_transition_once.fill_(False)
         else:
             self.phase[env_idx] = phase
+            self._suppress_transition_once[env_idx] = False
 
     def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
         env_idx = self._normalize_env_idx(env_idx)

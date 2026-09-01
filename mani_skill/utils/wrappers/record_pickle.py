@@ -51,13 +51,15 @@ class RecordPickle(gym.Wrapper):
             task_id = getattr(getattr(env, "spec", None), "id", None)
         self.task_spec = get_pickle_task_spec(task_id)
         self.task_id = self.task_spec.env.value
-        if base_env.control_mode != "pd_joint_pos":
+        if base_env.control_mode not in {"pd_joint_pos", "pd_ee_delta_pose"}:
             raise NotImplementedError(
-                "Online pickle recording requires control_mode='pd_joint_pos'"
+                "Online pickle recording requires control_mode='pd_joint_pos' "
+                "or 'pd_ee_delta_pose'"
             )
-        if base_env.obs_mode != "rgbd":
+        if base_env.obs_mode not in {"rgbd", "rgb+depth+state"}:
             raise NotImplementedError(
-                "RecordPickle requires obs_mode='rgbd' for both RGB-D streams"
+                "RecordPickle requires obs_mode='rgbd' or 'rgb+depth+state' "
+                "for both RGB-D streams"
             )
 
         self.output_dir = Path(output_dir)

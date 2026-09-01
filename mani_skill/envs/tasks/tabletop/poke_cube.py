@@ -38,6 +38,9 @@ class PokeCubeSkillFSM:
             dtype=torch.long,
             device=device,
         )
+        self._suppress_transition_once = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
+        )
 
     def _normalize_env_idx(self, env_idx=None):
         if env_idx is None:
@@ -58,8 +61,10 @@ class PokeCubeSkillFSM:
         env_idx = self._normalize_env_idx(env_idx)
         if env_idx is None:
             self.phase.fill_(int(PokeCubeSkillPhase.PICK))
+            self._suppress_transition_once.fill_(True)
         else:
             self.phase[env_idx] = int(PokeCubeSkillPhase.PICK)
+            self._suppress_transition_once[env_idx] = True
 
     def update(self, env, env_idx=None):
         env_idx = self._normalize_env_idx(env_idx)
@@ -75,12 +80,17 @@ class PokeCubeSkillFSM:
             is_peg_grasped = is_peg_grasped[env_idx]
             is_peg_cube_fit = is_peg_cube_fit[env_idx]
             success = success[env_idx]
+        suppress_transition_once = self._select(
+            self._suppress_transition_once, env_idx
+        )
 
         pick = phase == int(PokeCubeSkillPhase.PICK)
         align = phase == int(PokeCubeSkillPhase.ALIGN)
         push = phase == int(PokeCubeSkillPhase.PUSH)
         active = align | push
-        phase[pick & is_peg_grasped] = int(PokeCubeSkillPhase.ALIGN)
+        phase[pick & is_peg_grasped & ~suppress_transition_once] = int(
+            PokeCubeSkillPhase.ALIGN
+        )
         phase[align & is_peg_grasped & is_peg_cube_fit] = int(
             PokeCubeSkillPhase.PUSH
         )
@@ -89,8 +99,10 @@ class PokeCubeSkillFSM:
 
         if env_idx is None:
             self.phase.copy_(phase)
+            self._suppress_transition_once.fill_(False)
         else:
             self.phase[env_idx] = phase
+            self._suppress_transition_once[env_idx] = False
 
     def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
         env_idx = self._normalize_env_idx(env_idx)

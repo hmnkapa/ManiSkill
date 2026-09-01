@@ -19,7 +19,12 @@ from mani_skill.trajectory.pickle.action_adapter import (
     native_gripper_to_canonical,
 )
 from mani_skill.trajectory.pickle.buffer import TrajectoryBuffer
-from mani_skill.trajectory.pickle.schema import PickleEnv, SOURCE_ENV
+from mani_skill.trajectory.pickle.schema import (
+    ANNOTATION_SOURCE,
+    IMAGE_ANNOTATION_MODE,
+    PickleEnv,
+    SOURCE_ENV,
+)
 from mani_skill.trajectory.pickle.state_adapter import (
     PickCubeStateAdapter,
     PickleStateAdapter,
@@ -32,6 +37,7 @@ from mani_skill.trajectory.pickle.transforms import (
     apply_delta_quaternion_xyzw,
     normalize_quaternion_xyzw,
     pose_to_matrix,
+    quaternion_multiply_xyzw,
     relative_quaternion_xyzw,
     world_point_to_base,
     world_pose_to_base,
@@ -53,12 +59,12 @@ def _robot_state():
         "ee_quat_sim": np.array([0, 0, 0, 1], dtype=np.float32),
         "ee_pos_vel": np.zeros(3, dtype=np.float32),
         "ee_ori_vel": np.zeros(3, dtype=np.float32),
-        "gripper_width": 0.08,
+        "gripper_width": np.array([0.08], dtype=np.float32),
         "joint_positions": np.zeros(7, dtype=np.float32),
         "joint_velocities": np.zeros(7, dtype=np.float32),
         "joint_torques": np.zeros(9, dtype=np.float32),
-        "gripper_finger_1_pos": 0.04,
-        "gripper_finger_2_pos": 0.04,
+        "gripper_finger_1_pos": np.array([0.04], dtype=np.float32),
+        "gripper_finger_2_pos": np.array([0.04], dtype=np.float32),
     }
 
 
@@ -355,6 +361,85 @@ def test_fk_action_labels_joint_command_target(monkeypatch):
     assert action[7] == -1
 
 
+def test_ee_delta_pose_action_labels_physical_root_frame_target(monkeypatch):
+    import mani_skill.trajectory.pickle.action_adapter as action_module
+
+    physical = torch.tensor(
+        [[0.02, -0.03, 0.04, 0.05, -0.04, 0.03]], dtype=torch.float32
+    )
+
+    class FakeArm:
+        config = SimpleNamespace(
+            use_delta=True,
+            use_target=False,
+            frame="root_translation:root_aligned_body_rotation",
+        )
+
+        def _preprocess_action(self, action):
+            assert action.shape == (1, 6)
+            return physical.clone()
+
+    class FakeController:
+        controllers = {"arm": FakeArm(), "gripper": object()}
+        single_action_space = SimpleNamespace(shape=(7,))
+
+        @staticmethod
+        def to_action_dict(action):
+            return {"arm": action[:6], "gripper": action[6:]}
+
+    monkeypatch.setattr(action_module, "PDEEPoseController", FakeArm)
+    adapter = object.__new__(CanonicalActionAdapter)
+    adapter.base_env = SimpleNamespace(
+        control_mode="pd_ee_delta_pose", device="cpu"
+    )
+    adapter.controller = FakeController()
+    current_position = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+    current_quaternion = normalize_quaternion_xyzw([0.2, -0.1, 0.3, 0.9])
+    action = adapter.native_to_canonical(
+        np.array([0, 0, 0, 0, 0, 0, 4], dtype=np.float32),
+        current_position=current_position,
+        current_quaternion_xyzw=current_quaternion,
+    )
+    root_delta = normalize_quaternion_xyzw(
+        action_module.Rotation.from_euler("XYZ", physical.numpy()[0, 3:]).as_quat()
+    )
+    expected_target_quaternion = quaternion_multiply_xyzw(
+        root_delta, current_quaternion
+    )
+    assert np.allclose(action[:3], physical.numpy()[0, :3], atol=1e-6)
+    assert np.allclose(
+        apply_delta_quaternion_xyzw(current_quaternion, action[3:7]),
+        expected_target_quaternion,
+        atol=1e-6,
+    )
+    assert action[7] == -1
+
+
+def test_record_pickle_accepts_ppo_capture_modes(tmp_path, monkeypatch):
+    wrapper_module = importlib.import_module(
+        "mani_skill.utils.wrappers.record_pickle"
+    )
+
+    class FakeEnv(gym.Env):
+        num_envs = 1
+        robot_uids = "panda_wristcam"
+        control_mode = "pd_ee_delta_pose"
+        obs_mode = "rgb+depth+state"
+        spec = SimpleNamespace(id=PickleEnv.PICK_CUBE.value)
+
+        @property
+        def unwrapped(self):
+            return self
+
+    monkeypatch.setattr(
+        wrapper_module, "CanonicalActionAdapter", lambda env: object()
+    )
+    monkeypatch.setattr(wrapper_module, "PickleStateAdapter", lambda env: object())
+    recorder = wrapper_module.RecordPickle(FakeEnv(), tmp_path)
+    assert recorder.task_id == PickleEnv.PICK_CUBE.value
+    recorder.close()
+
+
 def test_buffer_t_plus_one_and_reset_guard():
     buffer = TrajectoryBuffer()
     buffer.start(_observation(), _camera_info())
@@ -366,9 +451,40 @@ def test_buffer_t_plus_one_and_reset_guard():
     assert len(result["actions"]) == len(result["rewards"]) == 1
     assert result["task"] == PickleEnv.PICK_CUBE.value
     assert result["env"] == SOURCE_ENV
+    assert result["annotation_source"] == ANNOTATION_SOURCE
+    assert result["image_annotation_mode"] == IMAGE_ANNOTATION_MODE
     assert isinstance(result["actions"], list)
     assert isinstance(result["rewards"], list)
     validate_trajectory(result)
+
+
+def test_buffer_moves_device_values_to_host_before_numpy_conversion():
+    class DeviceValue:
+        def __init__(self, value, *, on_host=False):
+            self.value = np.asarray(value)
+            self.on_host = on_host
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return DeviceValue(self.value, on_host=True)
+
+        def numpy(self):
+            if not self.on_host:
+                raise TypeError("device value must be copied to host first")
+            return self.value
+
+    buffer = TrajectoryBuffer()
+    buffer.start(_observation(), _camera_info())
+    buffer.append(
+        DeviceValue([0, 0, 0, 0, 0, 0, 1, 1]),
+        DeviceValue([0.5]),
+        _observation(),
+    )
+    result = buffer.finalize(success=False)
+    assert result["rewards"] == [0.5]
+    assert result["actions"][0] == [0, 0, 0, 0, 0, 0, 1, 1]
 
 
 def test_validator_rejects_schema_and_quaternion_errors():
@@ -385,6 +501,22 @@ def test_validator_rejects_schema_and_quaternion_errors():
     trajectory = _trajectory()
     trajectory["env"] = "OtherSimulator"
     with pytest.raises(TrajectoryValidationError, match="expected 'ManiSkill'"):
+        validate_trajectory(trajectory)
+
+    trajectory = _trajectory()
+    trajectory["annotation_source"] = "vlm"
+    with pytest.raises(TrajectoryValidationError, match="expected 'scripted'"):
+        validate_trajectory(trajectory)
+
+    trajectory = _trajectory()
+    trajectory["observations"][0]["skill"] = "pick"
+    trajectory["observations"][0]["guidance_point"] = np.zeros(
+        3, dtype=np.float32
+    )
+    trajectory["observations"][0]["guidance_point_clean"] = np.zeros(
+        3, dtype=np.float32
+    )
+    with pytest.raises(TrajectoryValidationError, match="visible front scripted point"):
         validate_trajectory(trajectory)
 
 

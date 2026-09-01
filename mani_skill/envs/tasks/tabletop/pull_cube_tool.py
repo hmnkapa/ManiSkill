@@ -43,6 +43,9 @@ class PullCubeToolSkillFSM:
         self.pull_target_q = torch.full(
             (num_envs, 4), float("nan"), dtype=torch.float32, device=device
         )
+        self._suppress_transition_once = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
+        )
 
     def _normalize_env_idx(self, env_idx=None):
         if env_idx is None:
@@ -107,10 +110,12 @@ class PullCubeToolSkillFSM:
             self.phase.fill_(int(PullCubeToolSkillPhase.PICK))
             self.pull_target_pos.fill_(float("nan"))
             self.pull_target_q.fill_(float("nan"))
+            self._suppress_transition_once.fill_(True)
         else:
             self.phase[env_idx] = int(PullCubeToolSkillPhase.PICK)
             self.pull_target_pos[env_idx] = float("nan")
             self.pull_target_q[env_idx] = float("nan")
+            self._suppress_transition_once[env_idx] = True
 
     def update(self, env, env_idx=None):
         env_idx = self._normalize_env_idx(env_idx)
@@ -123,6 +128,9 @@ class PullCubeToolSkillFSM:
             phase = self.phase.clone()
         else:
             phase = self.phase[env_idx].clone()
+        suppress_transition_once = self._select(
+            self._suppress_transition_once, env_idx
+        )
 
         pick = phase == int(PullCubeToolSkillPhase.PICK)
         align = phase == int(PullCubeToolSkillPhase.ALIGN)
@@ -145,14 +153,18 @@ class PullCubeToolSkillFSM:
             self.pull_target_pos[entering_indices] = pull_target_pos
             self.pull_target_q[entering_indices] = tcp_q[enter_pull]
 
-        phase[pick & is_tool_grasped] = int(PullCubeToolSkillPhase.ALIGN)
+        phase[pick & is_tool_grasped & ~suppress_transition_once] = int(
+            PullCubeToolSkillPhase.ALIGN
+        )
         phase[enter_pull] = int(PullCubeToolSkillPhase.PULL)
         phase[pull & success] = int(PullCubeToolSkillPhase.DONE)
 
         if env_idx is None:
             self.phase.copy_(phase)
+            self._suppress_transition_once.fill_(False)
         else:
             self.phase[env_idx] = phase
+            self._suppress_transition_once[env_idx] = False
 
     def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
         env_idx = self._normalize_env_idx(env_idx)

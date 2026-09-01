@@ -1,104 +1,84 @@
 #!/usr/bin/env python3
-"""Generate RR-compatible task pickles with Panda motion planners."""
+"""Roll out official state PPO checkpoints into RR-compatible RGB-D pickles."""
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
 import json
+import math
+import random
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
 import numpy as np
+import torch
+import torch.nn as nn
 
 import mani_skill.envs  # noqa: F401 - register ManiSkill Gym environments
-from mani_skill.examples.motionplanning.panda.solutions import (
-    solveLiftPegUpright,
-    solvePegInsertionSide,
-    solvePickCube,
-    solvePlaceSphere,
-    solvePlugCharger,
-    solvePullCube,
-    solvePullCubeTool,
-    solvePushCube,
-    solveStackCube,
-    solveStackPyramid,
-)
 from mani_skill.trajectory.pickle import (
-    PickleEnv,
     TrajectoryValidationError,
     rr_aligned_sensor_overrides,
 )
 from mani_skill.utils.wrappers import RecordPickle
 
 
-MOTION_PLANNING_SOLVERS = {
-    PickleEnv.LIFT_PEG_UPRIGHT.value: solveLiftPegUpright,
-    PickleEnv.PEG_INSERTION_SIDE.value: solvePegInsertionSide,
-    PickleEnv.PICK_CUBE.value: solvePickCube,
-    PickleEnv.PLACE_SPHERE.value: solvePlaceSphere,
-    PickleEnv.PLUG_CHARGER.value: solvePlugCharger,
-    PickleEnv.PULL_CUBE.value: solvePullCube,
-    PickleEnv.PULL_CUBE_TOOL.value: solvePullCubeTool,
-    PickleEnv.PUSH_CUBE.value: solvePushCube,
-    PickleEnv.STACK_CUBE.value: solveStackCube,
-    PickleEnv.STACK_PYRAMID.value: solveStackPyramid,
-}
+PPO_PICKLE_ENVS = (
+    "LiftPegUpright-v1",
+    "PickCube-v1",
+    "PokeCube-v1",
+    "PullCube-v1",
+    "PushCube-v1",
+    "StackCube-v1",
+)
+
+
+class PPOAgent(nn.Module):
+    """Exact network topology used by ``examples/baselines/ppo/ppo_fast.py``."""
+
+    def __init__(self, n_obs: int, n_act: int, device: torch.device):
+        super().__init__()
+        self.critic = nn.Sequential(
+            nn.Linear(n_obs, 256, device=device),
+            nn.Tanh(),
+            nn.Linear(256, 256, device=device),
+            nn.Tanh(),
+            nn.Linear(256, 256, device=device),
+            nn.Tanh(),
+            nn.Linear(256, 1, device=device),
+        )
+        self.actor_mean = nn.Sequential(
+            nn.Linear(n_obs, 256, device=device),
+            nn.Tanh(),
+            nn.Linear(256, 256, device=device),
+            nn.Tanh(),
+            nn.Linear(256, 256, device=device),
+            nn.Tanh(),
+            nn.Linear(256, n_act, device=device),
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, n_act, device=device))
 
 
 def parse_args(args=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate Panda motion-planning trajectories in RR pickle format."
+        description="Generate RR pickles from official ManiSkill PPO checkpoints."
     )
-    parser.add_argument(
-        "-e",
-        "--env-id",
-        choices=tuple(env.value for env in PickleEnv),
-        default=PickleEnv.PICK_CUBE.value,
-        help="Task to record. PokeCube-v1 is recordable but has no bundled solver.",
-    )
+    parser.add_argument("--env-id", choices=PPO_PICKLE_ENVS, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument(
         "--annotation-source",
         choices=("scripted",),
         required=True,
-        help="Required provenance gate; motion-planning targets are geometry GT.",
+        help="Required provenance gate; task annotations are geometry GT.",
     )
-    parser.add_argument(
-        "--num-traj",
-        type=int,
-        default=10,
-        help="Number of successful pickle trajectories to save.",
-    )
-    parser.add_argument(
-        "--record-dir",
-        type=Path,
-        default=Path("demos"),
-        help="Root output directory.",
-    )
+    parser.add_argument("--num-traj", type=int, default=100)
+    parser.add_argument("--record-dir", type=Path, default=Path("demos"))
     parser.add_argument("--start-seed", type=int, default=0)
-    parser.add_argument(
-        "--sim-backend",
-        type=str,
-        default="auto",
-        help="ManiSkill simulation backend, e.g. auto, cpu, or gpu.",
-    )
-    parser.add_argument(
-        "--shader",
-        type=str,
-        default="minimal",
-        help="Sensor shader pack (minimal, default, rt-fast, rt-med, or rt).",
-    )
-    parser.add_argument("--vis", action="store_true", help="Open the live viewer.")
-    parser.add_argument(
-        "--compress", action="store_true", help="Write .pkl.xz with LZMA."
-    )
-    parser.add_argument(
-        "--max-attempts",
-        type=int,
-        default=None,
-        help="Optional cap on successful plus failed planning attempts.",
-    )
+    parser.add_argument("--num-eval-steps", type=int, default=400)
+    parser.add_argument("--max-attempts", type=int, default=None)
+    parser.add_argument("--shader", default="minimal")
+    parser.add_argument("--compress", action="store_true")
     parser.add_argument(
         "--diagnostic-task-successes",
         type=int,
@@ -115,6 +95,8 @@ def parse_args(args=None) -> argparse.Namespace:
     parsed = parser.parse_args(args)
     if parsed.num_traj <= 0:
         parser.error("--num-traj must be positive")
+    if parsed.num_eval_steps <= 0:
+        parser.error("--num-eval-steps must be positive")
     if parsed.max_attempts is not None and parsed.max_attempts <= 0:
         parser.error("--max-attempts must be positive when provided")
     if (
@@ -129,32 +111,29 @@ def parse_args(args=None) -> argparse.Namespace:
             "--diagnostic-task-successes and --attempt-diagnostics-dir "
             "must be supplied together"
         )
-    if parsed.env_id not in MOTION_PLANNING_SOLVERS:
-        parser.error(
-            f"{parsed.env_id} supports RecordPickle, but no Panda motion-planning "
-            "solver is available; use RecordPickle with another rollout source"
-        )
     return parsed
 
 
-def _one_bool(value: Any) -> bool:
+def _one_bool(value: Any, name: str) -> bool:
     if hasattr(value, "detach"):
         value = value.detach().cpu().numpy()
     array = np.asarray(value).reshape(-1)
     if array.size != 1:
-        raise ValueError(f"Expected one boolean value, got shape {array.shape}")
+        raise ValueError(f"Expected one {name} value, got shape {array.shape}")
     return bool(array[0])
 
 
-def _planning_success(result: Any) -> bool:
-    if result is None or isinstance(result, (int, np.integer)):
-        return False
-    if not isinstance(result, (tuple, list)) or not result:
-        return False
-    info = result[-1]
-    if not isinstance(info, dict) or "success" not in info:
-        return False
-    return _one_bool(info["success"])
+def _policy_state(observation: Any, device: torch.device) -> torch.Tensor:
+    if not isinstance(observation, Mapping) or "state" not in observation:
+        raise KeyError("RGB-D plus state observation is missing the PPO state vector")
+    state = torch.as_tensor(observation["state"], device=device, dtype=torch.float32)
+    if state.ndim == 1:
+        state = state.unsqueeze(0)
+    if state.ndim != 2 or state.shape[0] != 1:
+        raise ValueError(f"Expected one PPO state row, got shape {tuple(state.shape)}")
+    if not torch.isfinite(state).all():
+        raise ValueError("PPO state contains a non-finite value")
+    return state
 
 
 def _json_value(value: Any) -> Any:
@@ -171,9 +150,7 @@ def _front_point_audit(trajectory: Mapping[str, Any]) -> dict[str, Any]:
     camera = trajectory["camera_info"]["front_camera"]
     image_size = np.asarray(camera["image_size"], dtype=np.int64)
     intrinsic = np.asarray(camera["intrinsics"], dtype=np.float64)
-    base_to_camera_rr = np.asarray(
-        camera["sim_local_to_camera"], dtype=np.float64
-    )
+    base_to_camera_rr = np.asarray(camera["sim_local_to_camera"], dtype=np.float64)
     observations = []
     for index, observation in enumerate(trajectory["observations"]):
         skill = observation.get("skill")
@@ -197,6 +174,7 @@ def _front_point_audit(trajectory: Mapping[str, Any]) -> dict[str, Any]:
             record["point_base"] = point_base.tolist()
             record["camera_depth"] = depth
             if np.isfinite(point_camera).all() and depth > 1e-8:
+                # RR camera coordinates use +Y up; image pixels use +V down.
                 u = intrinsic[0, 0] * point_camera[0] / depth + intrinsic[0, 2]
                 v = intrinsic[1, 2] - intrinsic[1, 1] * point_camera[1] / depth
                 uv = np.asarray([u, v], dtype=np.float64)
@@ -261,38 +239,40 @@ def _write_attempt_diagnostic(
 
 
 def generate(args: argparse.Namespace) -> list[Path]:
-    env_id = str(args.env_id)
-    if env_id not in MOTION_PLANNING_SOLVERS:
-        raise NotImplementedError(
-            f"{env_id} supports RecordPickle, but no Panda motion-planning "
-            "solver is available; use RecordPickle with another rollout source"
-        )
-    solve = MOTION_PLANNING_SOLVERS[env_id]
-    output_dir = args.record_dir / env_id / "motionplanning_pickle"
+    checkpoint = Path(args.checkpoint).resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"PPO checkpoint not found: {checkpoint}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("PPO pickle collection requires a CUDA GPU")
+    device = torch.device("cuda")
+    random.seed(args.start_seed)
+    np.random.seed(args.start_seed)
+    torch.manual_seed(args.start_seed)
+    torch.cuda.manual_seed_all(args.start_seed)
+    torch.backends.cudnn.deterministic = True
+
+    output_dir = Path(args.record_dir) / args.env_id / "ppo_pickle"
     env = gym.make(
-        env_id,
+        args.env_id,
         num_envs=1,
-        obs_mode="rgbd",
-        control_mode="pd_joint_pos",
+        obs_mode="rgb+depth+state",
+        control_mode="pd_ee_delta_pose",
         robot_uids="panda_wristcam",
         reward_mode="sparse",
-        render_mode="human" if args.vis else "sensors",
-        sim_backend=args.sim_backend,
-        sensor_configs=rr_aligned_sensor_overrides(args.shader, env_id),
-        human_render_camera_configs={"shader_pack": args.shader},
-        viewer_camera_configs={"shader_pack": args.shader},
+        render_mode="sensors",
+        sim_backend="physx_cuda",
+        sensor_configs=rr_aligned_sensor_overrides(args.shader, args.env_id),
     )
     recorder = RecordPickle(env, output_dir=output_dir, compress=args.compress)
     saved: list[Path] = []
     task_successes = 0
-    seed = int(args.start_seed)
     attempts = 0
-    diagnostic_task_successes = getattr(args, "diagnostic_task_successes", None)
-    attempt_diagnostics_dir = getattr(args, "attempt_diagnostics_dir", None)
+    seed = int(args.start_seed)
+    agent = None
     try:
         while (
-            task_successes < diagnostic_task_successes
-            if diagnostic_task_successes is not None
+            task_successes < args.diagnostic_task_successes
+            if args.diagnostic_task_successes is not None
             else len(saved) < args.num_traj
         ):
             if args.max_attempts is not None and attempts >= args.max_attempts:
@@ -301,51 +281,67 @@ def generate(args: argparse.Namespace) -> list[Path]:
                     f"{len(saved)}/{args.num_traj} successful trajectories"
                 )
             attempts += 1
-            try:
-                result = solve(recorder, seed=seed, debug=False, vis=bool(args.vis))
-                success = _planning_success(result)
-            except Exception as error:
-                success = False
-                print(
-                    f"[attempt {attempts}, seed {seed}] planning failed: "
-                    f"{type(error).__name__}: {error}"
+            observation, _ = recorder.reset(seed=seed)
+            state = _policy_state(observation, device)
+            if agent is None:
+                single_action_space = recorder.unwrapped.single_action_space
+                n_act = math.prod(single_action_space.shape)
+                agent = PPOAgent(state.shape[1], n_act, device)
+                state_dict = torch.load(
+                    checkpoint, map_location=device, weights_only=True
                 )
+                agent.load_state_dict(state_dict, strict=True)
+                agent.eval()
 
-            if success:
-                task_successes += 1
-                diagnostic_trajectory = None
-                if attempt_diagnostics_dir is not None:
-                    diagnostic_trajectory = recorder.buffer.finalize(
-                        success=True, task=env_id
-                    )
-                validation_error = None
-                try:
-                    path = recorder.flush_episode(success=True)
-                except TrajectoryValidationError as error:
-                    validation_error = str(error)
-                    success = False
-                    print(
-                        f"[attempt {attempts}, seed {seed}] rejected by strict "
-                        f"training-point gate: {error}",
-                        flush=True,
-                    )
-                else:
-                    saved.append(path)
-                    print(
-                        f"[{len(saved)}/{args.num_traj}] saved seed {seed}: {path}",
-                        flush=True,
-                    )
-                if attempt_diagnostics_dir is not None:
-                    diagnostic_path = _write_attempt_diagnostic(
-                        attempt_diagnostics_dir,
-                        task=env_id,
-                        seed=seed,
-                        attempt=attempts,
-                        task_success_index=task_successes,
-                        trajectory=diagnostic_trajectory,
-                        validation_error=validation_error,
-                    )
-                    print(f"diagnostic={diagnostic_path}", flush=True)
+            success = False
+            for _ in range(args.num_eval_steps):
+                with torch.no_grad():
+                    native_action = agent.actor_mean(state)
+                observation, _, terminated, truncated, info = recorder.step(
+                    native_action
+                )
+                success = _one_bool(info["success"], "success")
+                if success:
+                    task_successes += 1
+                    diagnostic_trajectory = None
+                    if args.attempt_diagnostics_dir is not None:
+                        diagnostic_trajectory = recorder.buffer.finalize(
+                            success=True, task=args.env_id
+                        )
+                    validation_error = None
+                    try:
+                        path = recorder.flush_episode(success=True)
+                    except TrajectoryValidationError as error:
+                        validation_error = str(error)
+                        success = False
+                        print(
+                            f"[attempt {attempts}, seed {seed}] rejected by strict "
+                            f"training-point gate: {error}",
+                            flush=True,
+                        )
+                    else:
+                        saved.append(path)
+                        print(
+                            f"[{len(saved)}/{args.num_traj}] saved seed {seed}: {path}",
+                            flush=True,
+                        )
+                    if args.attempt_diagnostics_dir is not None:
+                        diagnostic_path = _write_attempt_diagnostic(
+                            args.attempt_diagnostics_dir,
+                            task=args.env_id,
+                            seed=seed,
+                            attempt=attempts,
+                            task_success_index=task_successes,
+                            trajectory=diagnostic_trajectory,
+                            validation_error=validation_error,
+                        )
+                        print(f"diagnostic={diagnostic_path}", flush=True)
+                    break
+                if _one_bool(terminated, "termination") or _one_bool(
+                    truncated, "truncation"
+                ):
+                    break
+                state = _policy_state(observation, device)
             if not success:
                 recorder.discard_episode()
                 print(
@@ -355,7 +351,7 @@ def generate(args: argparse.Namespace) -> list[Path]:
             seed += 1
     finally:
         recorder.close()
-    if diagnostic_task_successes is not None:
+    if args.diagnostic_task_successes is not None:
         print(
             f"Diagnostic task successes={task_successes}, strict passes={len(saved)}",
             flush=True,
@@ -366,9 +362,7 @@ def generate(args: argparse.Namespace) -> list[Path]:
 def main(args=None) -> int:
     parsed = parse_args(args)
     saved = generate(parsed)
-    print(
-        f"Generated {len(saved)} successful {parsed.env_id} pickle trajectories."
-    )
+    print(f"Generated {len(saved)} successful {parsed.env_id} PPO pickles.")
     return 0
 
 

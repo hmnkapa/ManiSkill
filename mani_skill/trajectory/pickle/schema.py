@@ -35,6 +35,8 @@ PART_POSE_DIM = 7
 IMAGE_HEIGHT = 224
 IMAGE_WIDTH = 224
 SOURCE_ENV = "ManiSkill"
+ANNOTATION_SOURCE = "scripted"
+IMAGE_ANNOTATION_MODE = "none"
 
 ACTION_FIELDS = (
     "delta_x",
@@ -110,6 +112,8 @@ TRAJECTORY_KEYS = (
     "task",
     "action_type",
     "env",
+    "annotation_source",
+    "image_annotation_mode",
 )
 
 
@@ -127,12 +131,12 @@ class RobotState(TypedDict):
     ee_quat_sim: np.ndarray
     ee_pos_vel: np.ndarray
     ee_ori_vel: np.ndarray
-    gripper_width: float
+    gripper_width: np.ndarray
     joint_positions: np.ndarray
     joint_velocities: np.ndarray
     joint_torques: np.ndarray
-    gripper_finger_1_pos: float
-    gripper_finger_2_pos: float
+    gripper_finger_1_pos: np.ndarray
+    gripper_finger_2_pos: np.ndarray
 
 
 class CameraInfo(TypedDict):
@@ -177,6 +181,8 @@ class PickleTrajectory(TypedDict):
     task: str
     action_type: str
     env: str
+    annotation_source: str
+    image_annotation_mode: str
 
 
 SchemaMapping = dict[str, Any]
@@ -185,11 +191,13 @@ SchemaMapping = dict[str, Any]
 __all__ = [
     "ACTION_DIM",
     "ACTION_FIELDS",
+    "ANNOTATION_SOURCE",
     "CAMERA_INFO_KEYS",
     "CAMERA_TO_IMAGE_KEYS",
     "CameraInfo",
     "GraspAnnotation2D",
     "IMAGE_HEIGHT",
+    "IMAGE_ANNOTATION_MODE",
     "IMAGE_KEY_TO_CAMERA",
     "IMAGE_WIDTH",
     "OBSERVATION_KEYS",

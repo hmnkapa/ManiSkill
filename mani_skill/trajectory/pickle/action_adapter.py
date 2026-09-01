@@ -85,7 +85,9 @@ class CanonicalActionAdapter:
     ``pd_joint_pos`` conversion labels the command target: the seven arm joint
     targets are evaluated with forward kinematics before the environment step.
     Consequently the recorded action is independent of tracking error during
-    the simulator step.
+    the simulator step. ``pd_ee_delta_pose`` conversion reconstructs the
+    controller's physical root-frame target before expressing its rotation as
+    RR's right/body quaternion delta.
     """
 
     def __init__(self, env):
@@ -137,34 +139,76 @@ class CanonicalActionAdapter:
         current_position: Optional[Any] = None,
         current_quaternion_xyzw: Optional[Any] = None,
     ) -> np.ndarray:
-        """Convert a native ``pd_joint_pos`` command before calling ``step``."""
-
-        if self.control_mode != "pd_joint_pos":
-            raise NotImplementedError(
-                "Native-to-canonical conversion currently requires pd_joint_pos; "
-                f"got {self.control_mode!r}"
-            )
-        arm_controller = self.arm_controller
-        if not isinstance(arm_controller, PDJointPosController):
-            raise TypeError("The arm component is not a PDJointPosController")
-        if arm_controller.config.use_delta or arm_controller.config.use_target:
-            raise NotImplementedError(
-                "Only absolute, non-target-accumulating pd_joint_pos is supported"
-            )
+        """Convert a supported native command before calling ``step``."""
 
         flat_action = self._flat_action(action)
         action_dict = self.controller.to_action_dict(flat_action)
-        target_position, target_quaternion = self.fk_target_pose_base(
-            action_dict["arm"]
-        )
+        raw_gripper = as_numpy(action_dict["gripper"], dtype=np.float32).reshape(-1)
+        if raw_gripper.size != 1 or not np.isfinite(raw_gripper[0]):
+            raise ValueError("Native gripper command must be one finite value")
+        # Normalized ManiSkill controllers clip before scaling and execution.
+        executed_gripper = np.clip(raw_gripper[0], -1.0, 1.0)
         if current_position is None or current_quaternion_xyzw is None:
             current_position, current_quaternion_xyzw = self.current_tcp_pose_base()
+        current_position = np.asarray(current_position, dtype=np.float32).reshape(3)
+        current_quaternion_xyzw = normalize_quaternion_xyzw(
+            current_quaternion_xyzw
+        ).reshape(4)
+
+        arm_controller = self.arm_controller
+        if self.control_mode == "pd_joint_pos":
+            if not isinstance(arm_controller, PDJointPosController):
+                raise TypeError("The arm component is not a PDJointPosController")
+            if arm_controller.config.use_delta or arm_controller.config.use_target:
+                raise NotImplementedError(
+                    "Only absolute, non-target-accumulating pd_joint_pos is supported"
+                )
+            target_position, target_quaternion = self.fk_target_pose_base(
+                action_dict["arm"]
+            )
+        elif self.control_mode == "pd_ee_delta_pose":
+            if not isinstance(arm_controller, PDEEPoseController):
+                raise TypeError("The arm component is not a PDEEPoseController")
+            if arm_controller.config.use_target or not arm_controller.config.use_delta:
+                raise NotImplementedError(
+                    "pd_ee_delta_pose must use current-pose deltas (use_target=False)"
+                )
+            if (
+                arm_controller.config.frame
+                != "root_translation:root_aligned_body_rotation"
+            ):
+                raise NotImplementedError(
+                    "Only root_translation:root_aligned_body_rotation is supported"
+                )
+            arm_action = torch.as_tensor(
+                as_numpy(action_dict["arm"], dtype=np.float32).reshape(1, -1),
+                device=self.base_env.device,
+            )
+            with torch.no_grad():
+                physical = as_numpy(
+                    arm_controller._preprocess_action(arm_action.clone()),
+                    dtype=np.float32,
+                ).reshape(-1)
+            if physical.shape != (6,) or not np.isfinite(physical).all():
+                raise ValueError(
+                    "Preprocessed pd_ee_delta_pose arm action must be six finite values"
+                )
+            target_position = current_position + physical[:3]
+            root_delta = Rotation.from_euler("XYZ", physical[3:6]).as_quat()
+            target_quaternion = quaternion_multiply_xyzw(
+                root_delta, current_quaternion_xyzw
+            )
+        else:
+            raise NotImplementedError(
+                "Native-to-canonical conversion supports pd_joint_pos and "
+                f"pd_ee_delta_pose; got {self.control_mode!r}"
+            )
         return canonical_action(
             current_position,
             current_quaternion_xyzw,
             target_position,
             target_quaternion,
-            action_dict["gripper"],
+            executed_gripper,
         )
 
     def fk_target_pose_base(self, arm_action: Any) -> tuple[np.ndarray, np.ndarray]:

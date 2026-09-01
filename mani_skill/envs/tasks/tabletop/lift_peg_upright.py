@@ -44,6 +44,24 @@ class LiftPegUprightSkillFSM:
             dtype=torch.long,
             device=device,
         )
+        self._pick_target_pose_world = torch.full(
+            (num_envs, 4, 4),
+            float("nan"),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._pick_target_valid = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
+        )
+        self._lift_target_pose_world = torch.full(
+            (num_envs, 4, 4),
+            float("nan"),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._lift_target_valid = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
+        )
         self._rotate_target_pose_world = torch.full(
             (num_envs, 4, 4),
             float("nan"),
@@ -51,6 +69,22 @@ class LiftPegUprightSkillFSM:
             device=device,
         )
         self._rotate_target_valid = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
+        )
+        self._lower_target_pose_world = torch.full(
+            (num_envs, 4, 4),
+            float("nan"),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._lower_target_valid = torch.zeros(
+            (num_envs,), dtype=torch.bool, device=device
+        )
+        # Contact state can remain stale for the first annotation query after
+        # an episode reset.  Suppress exactly one PICK->LIFT transition for
+        # reset environments so a previous episode's grasp cannot leak a
+        # PLACE target into observation 0.
+        self._suppress_transition_once = torch.zeros(
             (num_envs,), dtype=torch.bool, device=device
         )
 
@@ -144,10 +178,84 @@ class LiftPegUprightSkillFSM:
             self._rotate_target_pose_world[target_env_idx] = target_pose_world[mask]
             self._rotate_target_valid[target_env_idx] = True
 
+    def _cache_pick_target(self, env, mask: torch.Tensor, env_idx=None):
+        peg_pose = Pose.create(self._select(env.peg.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        target_pose_world = (
+            build_panda_topdown_grasp_pose(
+                center=peg_pose.p,
+                tcp_pose=tcp_pose,
+                object_pose=peg_pose,
+            )
+            * Pose.create_from_pq(
+                p=torch.tensor(
+                    [0.10, 0.0, 0.0],
+                    dtype=peg_pose.p.dtype,
+                    device=env.device,
+                )
+            )
+        ).to_transformation_matrix()
+        if env_idx is None:
+            self._pick_target_pose_world[mask] = target_pose_world[mask]
+            self._pick_target_valid[mask] = True
+        else:
+            target_env_idx = env_idx[mask]
+            self._pick_target_pose_world[target_env_idx] = target_pose_world[mask]
+            self._pick_target_valid[target_env_idx] = True
+
+    def _cache_lift_target(self, env, mask: torch.Tensor, env_idx=None):
+        peg_pose = Pose.create(self._select(env.peg.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        lifted_peg_pose = self._lifted_peg_pose(env, peg_pose, upright=False)
+        target_pose_world = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=peg_pose,
+            desired_object_pose=lifted_peg_pose,
+        ).to_transformation_matrix()
+        if env_idx is None:
+            self._lift_target_pose_world[mask] = target_pose_world[mask]
+            self._lift_target_valid[mask] = True
+        else:
+            target_env_idx = env_idx[mask]
+            self._lift_target_pose_world[target_env_idx] = target_pose_world[mask]
+            self._lift_target_valid[target_env_idx] = True
+
+    def _cache_lower_target(self, env, mask: torch.Tensor, env_idx=None):
+        peg_pose = Pose.create(self._select(env.peg.pose.raw_pose, env_idx))
+        tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
+        desired_peg_pose = self._desired_peg_pose(env, peg_pose)
+        target_pose_world = target_tcp_pose_from_object_goal(
+            current_tcp_pose=tcp_pose,
+            current_object_pose=peg_pose,
+            desired_object_pose=desired_peg_pose,
+        ).to_transformation_matrix()
+        if env_idx is None:
+            self._lower_target_pose_world[mask] = target_pose_world[mask]
+            self._lower_target_valid[mask] = True
+        else:
+            target_env_idx = env_idx[mask]
+            self._lower_target_pose_world[target_env_idx] = target_pose_world[mask]
+            self._lower_target_valid[target_env_idx] = True
+
     def _invalidate_rotation_target(self, mask: torch.Tensor, env_idx=None):
         target_env_idx = mask if env_idx is None else env_idx[mask]
         self._rotate_target_pose_world[target_env_idx] = float("nan")
         self._rotate_target_valid[target_env_idx] = False
+
+    def _invalidate_pick_target(self, mask: torch.Tensor, env_idx=None):
+        target_env_idx = mask if env_idx is None else env_idx[mask]
+        self._pick_target_pose_world[target_env_idx] = float("nan")
+        self._pick_target_valid[target_env_idx] = False
+
+    def _invalidate_lift_target(self, mask: torch.Tensor, env_idx=None):
+        target_env_idx = mask if env_idx is None else env_idx[mask]
+        self._lift_target_pose_world[target_env_idx] = float("nan")
+        self._lift_target_valid[target_env_idx] = False
+
+    def _invalidate_lower_target(self, mask: torch.Tensor, env_idx=None):
+        target_env_idx = mask if env_idx is None else env_idx[mask]
+        self._lower_target_pose_world[target_env_idx] = float("nan")
+        self._lower_target_valid[target_env_idx] = False
 
     def _compute_signals(self, env, env_idx=None):
         env_idx = self._normalize_env_idx(env_idx)
@@ -191,12 +299,26 @@ class LiftPegUprightSkillFSM:
         env_idx = self._normalize_env_idx(env_idx)
         if env_idx is None:
             self.phase.fill_(int(LiftPegUprightSkillPhase.PICK))
+            self._pick_target_pose_world.fill_(float("nan"))
+            self._pick_target_valid.fill_(False)
+            self._lift_target_pose_world.fill_(float("nan"))
+            self._lift_target_valid.fill_(False)
             self._rotate_target_pose_world.fill_(float("nan"))
             self._rotate_target_valid.fill_(False)
+            self._lower_target_pose_world.fill_(float("nan"))
+            self._lower_target_valid.fill_(False)
+            self._suppress_transition_once.fill_(True)
         else:
             self.phase[env_idx] = int(LiftPegUprightSkillPhase.PICK)
+            self._pick_target_pose_world[env_idx] = float("nan")
+            self._pick_target_valid[env_idx] = False
+            self._lift_target_pose_world[env_idx] = float("nan")
+            self._lift_target_valid[env_idx] = False
             self._rotate_target_pose_world[env_idx] = float("nan")
             self._rotate_target_valid[env_idx] = False
+            self._lower_target_pose_world[env_idx] = float("nan")
+            self._lower_target_valid[env_idx] = False
+            self._suppress_transition_once[env_idx] = True
 
     def update(self, env, env_idx=None):
         env_idx = self._normalize_env_idx(env_idx)
@@ -210,29 +332,40 @@ class LiftPegUprightSkillFSM:
             phase = self.phase.clone()
         else:
             phase = self.phase[env_idx].clone()
+        suppress_transition_once = self._select(
+            self._suppress_transition_once, env_idx
+        )
 
         pick = phase == int(LiftPegUprightSkillPhase.PICK)
         lift = phase == int(LiftPegUprightSkillPhase.LIFT)
         rotate = phase == int(LiftPegUprightSkillPhase.ROTATE)
         lower = phase == int(LiftPegUprightSkillPhase.LOWER)
         active = lift | rotate | lower
-        enter_lift = pick & is_grasped
+        enter_lift = pick & is_grasped & ~suppress_transition_once
         enter_rotate = lift & is_grasped & is_lifted
+        enter_lower = rotate & is_grasped & orientation_aligned
         grasp_lost = active & ~is_grasped & ~success
+        self._invalidate_pick_target(grasp_lost, env_idx)
+        self._cache_lift_target(env, enter_lift, env_idx)
+        self._invalidate_lift_target(grasp_lost, env_idx)
         self._invalidate_rotation_target(enter_lift | grasp_lost, env_idx)
         self._cache_rotation_target(env, enter_rotate, env_idx)
+        self._invalidate_lower_target(
+            enter_lift | enter_rotate | grasp_lost, env_idx
+        )
+        self._cache_lower_target(env, enter_lower, env_idx)
         phase[enter_lift] = int(LiftPegUprightSkillPhase.LIFT)
         phase[enter_rotate] = int(LiftPegUprightSkillPhase.ROTATE)
-        phase[rotate & is_grasped & orientation_aligned] = int(
-            LiftPegUprightSkillPhase.LOWER
-        )
+        phase[enter_lower] = int(LiftPegUprightSkillPhase.LOWER)
         phase[lower & success] = int(LiftPegUprightSkillPhase.DONE)
         phase[grasp_lost] = int(LiftPegUprightSkillPhase.PICK)
 
         if env_idx is None:
             self.phase.copy_(phase)
+            self._suppress_transition_once.fill_(False)
         else:
             self.phase[env_idx] = phase
+            self._suppress_transition_once[env_idx] = False
 
     def build_context(self, env, env_idx=None) -> SkillAnnotationContext:
         env_idx = self._normalize_env_idx(env_idx)
@@ -252,37 +385,32 @@ class LiftPegUprightSkillFSM:
 
         peg_pose = Pose.create(self._select(env.peg.pose.raw_pose, env_idx))
         tcp_pose = Pose.create(self._select(env.agent.tcp.pose.raw_pose, env_idx))
-        pick_target_pose = build_panda_topdown_grasp_pose(
-            center=peg_pose.p,
-            tcp_pose=tcp_pose,
-            object_pose=peg_pose,
-        )
-        pick_target_pose = pick_target_pose * Pose.create_from_pq(
-            p=torch.tensor([0.10, 0.0, 0.0], device=env.device)
+        pick_target_valid = self._select(self._pick_target_valid, env_idx)
+        self._cache_pick_target(env, pick & ~pick_target_valid, env_idx)
+        pick_target_pose_world = self._select(
+            self._pick_target_pose_world, env_idx
         )
 
-        lifted_peg_pose = self._lifted_peg_pose(env, peg_pose, upright=False)
-        lift_target_pose = target_tcp_pose_from_object_goal(
-            current_tcp_pose=tcp_pose,
-            current_object_pose=peg_pose,
-            desired_object_pose=lifted_peg_pose,
+        lift_target_valid = self._select(self._lift_target_valid, env_idx)
+        self._cache_lift_target(env, lift & ~lift_target_valid, env_idx)
+        lift_target_pose_world = self._select(
+            self._lift_target_pose_world, env_idx
         )
         rotate_target_valid = self._select(self._rotate_target_valid, env_idx)
         self._cache_rotation_target(env, rotate & ~rotate_target_valid, env_idx)
         rotate_target_pose_world = self._select(
             self._rotate_target_pose_world, env_idx
         )
-        desired_peg_pose = self._desired_peg_pose(env, peg_pose)
-        lower_target_pose = target_tcp_pose_from_object_goal(
-            current_tcp_pose=tcp_pose,
-            current_object_pose=peg_pose,
-            desired_object_pose=desired_peg_pose,
+        lower_target_valid = self._select(self._lower_target_valid, env_idx)
+        self._cache_lower_target(env, lower & ~lower_target_valid, env_idx)
+        lower_target_pose_world = self._select(
+            self._lower_target_pose_world, env_idx
         )
 
-        target_pose_world = pick_target_pose.to_transformation_matrix()
+        target_pose_world = pick_target_pose_world.clone()
         target_pose_world = torch.where(
             lift[:, None, None],
-            lift_target_pose.to_transformation_matrix(),
+            lift_target_pose_world,
             target_pose_world,
         )
         target_pose_world = torch.where(
@@ -292,7 +420,7 @@ class LiftPegUprightSkillFSM:
         )
         target_pose_world = torch.where(
             lower[:, None, None],
-            lower_target_pose.to_transformation_matrix(),
+            lower_target_pose_world,
             target_pose_world,
         )
         target_pose_world[done] = float("nan")

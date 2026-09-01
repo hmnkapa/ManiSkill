@@ -27,7 +27,8 @@ def get_python_version():
 
 def get_dependencies():
     install_requires = [
-        "numpy>=1.22",
+        "numpy>=1.22,<2",
+        "opencv-python>=4,<5",
         "scipy",
         "dacite",
         "gymnasium>=0.29.1",

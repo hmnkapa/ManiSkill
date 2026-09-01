@@ -164,12 +164,12 @@ class PickleStateAdapter:
             "ee_quat_sim": ee_quat.astype(np.float32).copy(),
             "ee_pos_vel": ee_pos_vel.astype(np.float32),
             "ee_ori_vel": ee_ori_vel.astype(np.float32),
-            "gripper_width": float(finger1 + finger2),
+            "gripper_width": np.array([finger1 + finger2], dtype=np.float32),
             "joint_positions": qpos[arm_indices].astype(np.float32),
             "joint_velocities": qvel[arm_indices].astype(np.float32),
             "joint_torques": qf.astype(np.float32),
-            "gripper_finger_1_pos": finger1,
-            "gripper_finger_2_pos": finger2,
+            "gripper_finger_1_pos": np.array([finger1], dtype=np.float32),
+            "gripper_finger_2_pos": np.array([finger2], dtype=np.float32),
         }
 
     def _parts_poses(self, world_base: np.ndarray) -> np.ndarray:

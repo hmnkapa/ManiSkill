@@ -1,5 +1,6 @@
 """RR-compatible online pickle trajectory recording."""
 
+from .camera_contract import rr_aligned_sensor_overrides, rr_front_camera_parameters
 from .schema import (
     ACTION_DIM,
     ACTION_FIELDS,
@@ -40,6 +41,8 @@ __all__ = [
     "TrajectoryValidationError",
     "get_pickle_task_spec",
     "read_trajectory",
+    "rr_aligned_sensor_overrides",
+    "rr_front_camera_parameters",
     "validate_trajectory",
     "write_trajectory",
 ]

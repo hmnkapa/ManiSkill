@@ -9,12 +9,26 @@ import numpy as np
 
 from .schema import (
     ACTION_DIM,
+    ANNOTATION_SOURCE,
     CameraInfo,
+    IMAGE_ANNOTATION_MODE,
     PickleEnv,
     PickleObservation,
     PickleTrajectory,
     SOURCE_ENV,
 )
+
+
+def _to_numpy(value: Any, *, dtype: np.dtype) -> np.ndarray:
+    """Copy an array-like value to host NumPy, including device tensors."""
+
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value, dtype=dtype)
 
 
 class TrajectoryBuffer:
@@ -61,7 +75,7 @@ class TrajectoryBuffer:
 
         if not self.active:
             raise RuntimeError("Trajectory buffer has not been started by reset()")
-        action_array = np.asarray(action, dtype=np.float32).reshape(-1)
+        action_array = _to_numpy(action, dtype=np.float32).reshape(-1)
         if action_array.shape != (ACTION_DIM,):
             raise ValueError(
                 f"Canonical action must have shape ({ACTION_DIM},), got "
@@ -69,7 +83,7 @@ class TrajectoryBuffer:
             )
         if not np.isfinite(action_array).all():
             raise ValueError("Canonical action contains a non-finite value")
-        reward_array = np.asarray(reward, dtype=np.float32).reshape(-1)
+        reward_array = _to_numpy(reward, dtype=np.float32).reshape(-1)
         if reward_array.size != 1 or not np.isfinite(reward_array[0]):
             raise ValueError("Reward must be one finite scalar")
 
@@ -122,6 +136,8 @@ class TrajectoryBuffer:
             "task": task.value if isinstance(task, PickleEnv) else str(task),
             "action_type": "delta",
             "env": SOURCE_ENV,
+            "annotation_source": ANNOTATION_SOURCE,
+            "image_annotation_mode": IMAGE_ANNOTATION_MODE,
         }
 
     def clear(self) -> None:

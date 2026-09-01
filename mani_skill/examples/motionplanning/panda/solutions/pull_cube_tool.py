@@ -41,14 +41,21 @@ def solve(env: PullCubeToolEnv, seed=None, debug=False, vis=False):
     # -------------------------------------------------------------------------- #
     reach_pose = grasp_pose * sapien.Pose([0, 0, -0.05])
     res = planner.move_to_pose_with_screw(reach_pose)
-    if res == -1: return res
+    if res == -1:
+        planner.close()
+        return res
 
     # -------------------------------------------------------------------------- #
     # Grasp
     # -------------------------------------------------------------------------- #
     res = planner.move_to_pose_with_screw(grasp_pose)
-    if res == -1: return res
+    if res == -1:
+        planner.close()
+        return res
     planner.close_gripper()
+    if not bool(env.agent.is_grasping(env.l_shape_tool).item()):
+        planner.close()
+        return -1
 
     # -------------------------------------------------------------------------- #
     # Lift tool to safe height
@@ -57,7 +64,12 @@ def solve(env: PullCubeToolEnv, seed=None, debug=False, vis=False):
     lift_pose = sapien.Pose(grasp_pose.p + np.array([0, 0, lift_height]))
     lift_pose.set_q(grasp_pose.q)  # Maintain grasp orientation
     res = planner.move_to_pose_with_screw(lift_pose)
-    if res == -1: return res
+    if res == -1:
+        planner.close()
+        return res
+    if not bool(env.agent.is_grasping(env.l_shape_tool).item()):
+        planner.close()
+        return -1
 
     cube_pos = env.cube.pose.sp.p
     approach_offset = sapien.Pose(
@@ -69,7 +81,9 @@ def solve(env: PullCubeToolEnv, seed=None, debug=False, vis=False):
     approach_pose.set_q(grasp_pose.q)
     
     res = planner.move_to_pose_with_screw(approach_pose)
-    if res == -1: return res
+    if res == -1:
+        planner.close()
+        return res
 
     # -------------------------------------------------------------------------- #
     # Lower tool behind cube
@@ -83,7 +97,9 @@ def solve(env: PullCubeToolEnv, seed=None, debug=False, vis=False):
     hook_pose.set_q(grasp_pose.q)
     
     res = planner.move_to_pose_with_screw(hook_pose)
-    if res == -1: return res
+    if res == -1:
+        planner.close()
+        return res
 
     # -------------------------------------------------------------------------- #
     # Pull cube
@@ -91,7 +107,9 @@ def solve(env: PullCubeToolEnv, seed=None, debug=False, vis=False):
     pull_offset = sapien.Pose([-0.35, 0, 0])
     target_pose = hook_pose * pull_offset
     res = planner.move_to_pose_with_screw(target_pose)
-    if res == -1: return res
+    if res == -1:
+        planner.close()
+        return res
 
     planner.close()
     return res
